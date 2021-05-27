@@ -33,7 +33,7 @@ impl Dict {
     }
 
     /// Inserts a key/value pair.
-    pub fn insert(&self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> Result<()> {
+    pub fn insert(&self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> Result<Option<Bytes>> {
         self.inner.write(key.into(), val.into())
     }
 
@@ -292,23 +292,32 @@ impl DictInner {
         Ok(())
     }
 
-    /// Writes a key-value pair.
-    fn write(&self, key: Bytes, value: Bytes) -> Result<()> {
+    /// Writes a key-value pair, returning the previous value
+    fn write(&self, key: Bytes, value: Bytes) -> Result<Option<Bytes>> {
         // first populate the cache
         self.maybe_gc()?;
         let mut cache = self.cache.write();
-        cache.insert(
-            key.clone(),
-            CacheEntry {
-                value: value.clone(),
-                pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
-            },
-        );
+        // we want to return the previous value.
+        // if there's a previous value in the cache, perfect! that's our previous value
+        // otherwise, the previous value is in the disk. the disk value cannot possibly be out of date, because if there are inflight writes, there would be cache.
+        let previous = cache
+            .insert(
+                key.clone(),
+                CacheEntry {
+                    value: value.clone(),
+                    pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
+                },
+            )
+            .map(|v| v.value);
         // we now signal the background thread
+        let actual_previous = match previous {
+            None => self.read_uncached(&key)?,
+            Some(val) => Some(val),
+        };
         self.send_change
             .send(SyncInstruction::Write(key, value))
             .map_err(|_| DbError::WriteThreadFailed)?;
-        Ok(())
+        Ok(actual_previous)
     }
 
     /// Reads, using the cache
