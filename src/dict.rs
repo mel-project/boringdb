@@ -38,8 +38,8 @@ impl Dict {
     }
 
     /// Delete a key.
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.inner.delete(key)
+    pub fn remove(&self, key: &[u8]) -> Result<()> {
+        self.inner.remove(key)
     }
 
     /// Create a new mapping based on a table name.
@@ -122,7 +122,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Delete a key.
-    pub fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
+    pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
         self.cache.remove(key.as_ref());
         self.to_write
             .push((Bytes::copy_from_slice(key.as_ref()), None));
@@ -282,7 +282,7 @@ impl DictInner {
     }
 
     /// Deletes a key.
-    fn delete(&self, key: &[u8]) -> Result<()> {
+    fn remove(&self, key: &[u8]) -> Result<()> {
         let mut cache = self.cache.write();
         cache.remove(key);
         // we now signal the background thread
