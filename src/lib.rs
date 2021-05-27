@@ -1,11 +1,11 @@
-//! A SQLite-based, single-process, key-value database. You want boringdb if:
-//! - You want high performance somewhat approaching that of databases like sled and RocksDB
-//! - You don't need SQL, multiprocess support, or the other cool features of SQLite
-//! - You want SQLite's proven reliability
-//! ## A note on durability
-//! By default, boringdb has *eventual durability*: database state is guaranteed to be consistent even in the face of arbitrary crashes, and transactions are guaranteed to have "serializable" semantics. However, after a crash the database may be slightly *out of date*, usually by a fraction of a second.
-//!
-//! To avoid this behavior, use the [Dict::flush] method to manually force synchronization with disk. Note that this comes with a fairly severe performance cost.
+// ! A SQLite-based, single-process, key-value database. You want boringdb if:
+// ! - You want high performance somewhat approaching that of databases like sled and RocksDB
+// ! - You don't need SQL, multiprocess support, or the other cool features of SQLite
+// ! - You want SQLite's proven reliability
+// ! ## A note on durability
+// ! By default, boringdb has *eventual durability*: database state is guaranteed to be consistent even in the face of arbitrary crashes, and transactions are guaranteed to have "serializable" semantics. However, after a crash the database may be slightly *out of date*, usually by a fraction of a second.
+// !
+// ! To avoid this behavior, use the [Dict::flush] method to manually force synchronization with disk. Note that this comes with a fairly severe performance cost.
 
 mod dict;
 mod low_level;
