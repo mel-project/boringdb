@@ -528,6 +528,8 @@ fn sync_to_disk(
         for flush in flush_buff {
             flush.send(()).ok()?;
         }
+        // at least sleep 50ms
+        std::thread::sleep(Duration::from_millis(50));
     }
     unreachable!()
 }
