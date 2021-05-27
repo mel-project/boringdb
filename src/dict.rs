@@ -132,6 +132,9 @@ impl<'a> Transaction<'a> {
     /// Gets a key/value pair.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         if let Some(res) = self.cache.get(key) {
+            if res.deleted {
+                return Ok(None);
+            }
             res.pseudotime.store(
                 GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
                 Ordering::Relaxed,
@@ -185,6 +188,7 @@ impl<'a> Transaction<'a> {
 struct CacheEntry {
     value: Bytes,
     pseudotime: AtomicU64,
+    deleted: bool,
 }
 
 impl CacheEntry {
@@ -192,6 +196,7 @@ impl CacheEntry {
         Self {
             value,
             pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
+            deleted: false,
         }
     }
 }
@@ -284,9 +289,15 @@ impl DictInner {
     /// Deletes a key.
     fn remove(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let mut cache = self.cache.write();
-        let previous = match cache.remove(key) {
+        let previous = match cache.get_mut(key) {
             None => self.read_uncached(&key)?,
-            Some(val) => Some(val.value),
+            Some(val) => {
+                if val.deleted {
+                    return Ok(None);
+                }
+                val.deleted = true;
+                Some(val.value.clone())
+            }
         };
         // we now signal the background thread
         self.send_change
@@ -304,13 +315,7 @@ impl DictInner {
         // if there's a previous value in the cache, perfect! that's our previous value
         // otherwise, the previous value is in the disk. the disk value cannot possibly be out of date, because if there are inflight writes, there would be cache.
         let previous = cache
-            .insert(
-                key.clone(),
-                CacheEntry {
-                    value: value.clone(),
-                    pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
-                },
-            )
+            .insert(key.clone(), CacheEntry::new(value.clone()))
             .map(|v| v.value);
         // we now signal the background thread
         let actual_previous = match previous {
@@ -326,25 +331,32 @@ impl DictInner {
     /// Reads, using the cache
     fn read(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.maybe_gc()?;
-        let cache = self.cache.upgradable_read();
-        // first we check the cache
-        if let Some(res) = cache.get(key) {
-            res.pseudotime.store(
-                GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            let value = res.value.clone();
-            Ok(Some(value))
-        } else {
-            let value = self.read_uncached(key)?;
-            // try to upgrade to write lock. if we can't, that's okay too
-            let cache = RwLockUpgradableReadGuard::try_upgrade(cache);
-            if let Ok(mut cache) = cache {
-                if let Some(value) = value.as_ref() {
-                    cache.insert(Bytes::copy_from_slice(key), CacheEntry::new(value.clone()));
+        loop {
+            let cache = self.cache.upgradable_read();
+            // first we check the cache
+            if let Some(res) = cache.get(key) {
+                if res.deleted {
+                    return Ok(None);
                 }
+                res.pseudotime.store(
+                    GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                let value = res.value.clone();
+                return Ok(Some(value));
+            } else {
+                let value = self.read_uncached(key)?;
+                // try to upgrade to write lock. if we can't, that's okay too
+                let cache = RwLockUpgradableReadGuard::try_upgrade(cache);
+                if let Ok(mut cache) = cache {
+                    if let Some(value) = value.as_ref() {
+                        cache.insert(Bytes::copy_from_slice(key), CacheEntry::new(value.clone()));
+                    }
+                } else {
+                    continue;
+                }
+                return Ok(value);
             }
-            Ok(value)
         }
     }
 
@@ -472,6 +484,9 @@ fn sync_to_disk(
             instructions.len(),
             max_batch_size,
         );
+
+        // continue;
+
         if instructions.len() >= max_batch_size {
             max_batch_size += 10;
         }
