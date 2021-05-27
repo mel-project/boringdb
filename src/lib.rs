@@ -1,3 +1,12 @@
+//! A SQLite-based, single-process, key-value database. You want boringdb if:
+//! - You want high performance somewhat approaching that of databases like sled and RocksDB
+//! - You don't need SQL, multiprocess support, or the other cool features of SQLite
+//! - You want SQLite's proven reliability
+//! ## A note on durability
+//! By default, boringdb has *eventual durability*: database state is guaranteed to be consistent even in the face of arbitrary crashes, and transactions are guaranteed to have "serializable" semantics. However, after a crash the database may be slightly *out of date*, usually by a fraction of a second.
+//!
+//! To avoid this behavior, use the [Dict::flush] method to manually force synchronization with disk. Note that this comes with a fairly severe performance cost.
+
 mod dict;
 mod low_level;
 pub use dict::*;
@@ -20,6 +29,9 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryInto;
+
+    use easy_parallel::Parallel;
     use nanorand::RNG;
 
     use env_logger::Env;
@@ -32,9 +44,9 @@ mod tests {
     #[test]
     fn simple_writes() {
         init_logs();
-        let database = Database::open("/home/miyuruasuka/labooyah.db").unwrap();
+        let database = Database::open("/tmp/labooyah.db").unwrap();
         let dict = database.open_dict("labooyah").unwrap();
-        for i in 0..100000 {
+        for _ in 0..100 {
             let key = format!(
                 "hello world {}",
                 nanorand::tls_rng().generate_range(0, u64::MAX)
@@ -48,5 +60,49 @@ mod tests {
                 b"oh no"
             );
         }
+    }
+    #[test]
+    fn transactional_increment() {
+        init_logs();
+
+        const THREADS: u64 = 100;
+        const INCREMENTS: u64 = 100;
+        {
+            let database = Database::open("/tmp/transactions.db").unwrap();
+            let dict = database.open_dict("labooyah").unwrap();
+            dict.insert(b"counter".to_vec(), 0u64.to_be_bytes().to_vec())
+                .unwrap();
+            let mut parallel = Parallel::new();
+
+            for _ in 0..THREADS {
+                parallel = parallel.add(|| {
+                    for _ in 0..INCREMENTS {
+                        let mut txn = dict.transaction().unwrap();
+                        let counter = u64::from_be_bytes(
+                            txn.get(b"counter")
+                                .unwrap()
+                                .unwrap()
+                                .as_ref()
+                                .try_into()
+                                .unwrap(),
+                        );
+                        txn.insert(b"counter".to_vec(), (counter + 1).to_be_bytes().to_vec())
+                            .unwrap();
+                    }
+                });
+            }
+            parallel.run();
+        }
+        let database = Database::open("/tmp/transactions.db").unwrap();
+        let dict = database.open_dict("labooyah").unwrap();
+        let final_count = u64::from_be_bytes(
+            dict.get(b"counter")
+                .unwrap()
+                .unwrap()
+                .as_ref()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(final_count, THREADS * INCREMENTS);
     }
 }

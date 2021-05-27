@@ -3,6 +3,9 @@ name = "boringdb"
 version = "0.1.0"
 authors = ["nullchinchilla <nullchinchilla@pm.me>"]
 edition = "2018"
+description="Robust, reasonably high-performance key-value database built on SQLite "
+license = "ISC"
+repository="https://github.com/themeliolabs/boringdb"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,7 +17,10 @@ parking_lot="0.11"
 log="0.4"
 nanorand={version="0.5", default-features=false, features=["std", "tls"]}
 thiserror="1.0"
+genawaiter={version="0.99.1", default-features=false}
+itertools="0.10"
 
 [dev-dependencies]
 criterion = "0.3"
 env_logger="0.8"
+easy-parallel="3"

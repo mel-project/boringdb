@@ -1,6 +1,8 @@
+#![allow(clippy::mutable_key_type)]
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     mem::ManuallyDrop,
+    ops::{Bound, RangeBounds},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -13,9 +15,10 @@ use crate::Result;
 use crate::{low_level::LowLevel, DbError};
 use bytes::Bytes;
 use flume::{Receiver, Sender};
+use genawaiter::rc::Gen;
 use nanorand::RNG;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use rusqlite::OptionalExtension;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use rusqlite::{OptionalExtension, Row};
 
 /// A clonable on-disk mapping, corresponding to a table in SQLite
 #[derive(Clone)]
@@ -34,11 +37,146 @@ impl Dict {
         self.inner.write(key.into(), val.into())
     }
 
+    /// Delete a key.
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.inner.delete(key)
+    }
+
     /// Create a new mapping based on a table name.
     pub(crate) fn new(low_level: Arc<LowLevel>, table_name: &str) -> Self {
         Self {
             inner: Arc::new(DictInner::new(low_level, table_name)),
         }
+    }
+
+    /// Iterate through tuples of keys and values, where the keys fall within the specified range.
+    ///
+    /// **Note**: currently this function returns an iterator that locks the whole dictionary until it is dropped. This will change the future.
+    pub fn range<'a, K: AsRef<[u8]> + Ord + 'a, R: RangeBounds<K> + 'a>(
+        &'a self,
+        range: R,
+    ) -> Result<impl Iterator<Item = Result<(Bytes, Bytes)>> + 'a> {
+        let tx = self.transaction()?;
+        let gen = Gen::new(move |co| async move {
+            let it = tx.range(range);
+            match it {
+                Ok(it) => {
+                    for val in it {
+                        co.yield_(val).await;
+                    }
+                }
+                Err(err) => {
+                    co.yield_(Err(err)).await;
+                }
+            }
+        });
+        Ok(gen.into_iter())
+    }
+
+    /// Runs a transaction. This is NOT optimistic, but rather locking, so care should be taken to avoid long-running transactions.
+    pub fn transaction(&'_ self) -> Result<Transaction<'_>> {
+        let cache = self.inner.cache.write();
+        let txn = Transaction {
+            send_change: &self.inner.send_change,
+            cache,
+            read_uncached: Box::new(move |val| self.inner.read_uncached(val)),
+            dinner: &self.inner,
+            to_write: Default::default(),
+        };
+        Ok(txn)
+    }
+
+    /// Flushes to disk. Guarantees that all operations that happens before the call reaches disk before this call terminates.
+    ///
+    /// **Note**: This can be very slow, especially after a large number of writes. Calling this function is not needed for atomicity or crash-safety, but only when you want to absolutely prevent the database from traveling "back in time" a few seconds in case of a crash. Usually this is only needed if you e.g. want to store a reference to an object in this boringdb database in some other database, and you cannot tolerate "dangling pointers".
+    pub fn flush(&self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A transaction handle, which is passed to transaction closures.
+pub struct Transaction<'a> {
+    send_change: &'a Sender<SyncInstruction>,
+    cache: RwLockWriteGuard<'a, BTreeMap<Bytes, CacheEntry>>,
+    to_write: Vec<(Bytes, Option<Bytes>)>,
+    dinner: &'a DictInner,
+    read_uncached: Box<dyn Fn(&[u8]) -> Result<Option<Bytes>> + 'a>,
+}
+
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {
+        let _ = self
+            .send_change
+            .send(SyncInstruction::WriteBatch(self.to_write.clone()));
+    }
+}
+
+impl<'a> Transaction<'a> {
+    /// Inserts a key/value pair.
+    pub fn insert(&mut self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> Result<()> {
+        let key: Bytes = key.into();
+        let val: Bytes = val.into();
+        self.cache.insert(key.clone(), CacheEntry::new(val.clone()));
+        self.to_write.push((key, Some(val)));
+        Ok(())
+    }
+
+    /// Delete a key.
+    pub fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
+        self.cache.remove(key.as_ref());
+        self.to_write
+            .push((Bytes::copy_from_slice(key.as_ref()), None));
+        Ok(())
+    }
+
+    /// Gets a key/value pair.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if let Some(res) = self.cache.get(key) {
+            res.pseudotime.store(
+                GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            let value = res.value.clone();
+            Ok(Some(value))
+        } else {
+            let value = (self.read_uncached)(key)?;
+            // if let Some(value) = value.as_ref() {
+            //     self.cache
+            //         .insert(Bytes::copy_from_slice(key), CacheEntry::new(value.clone()));
+            // }
+            Ok(value)
+        }
+    }
+
+    /// Iterate through tuples of keys and values, where the keys fall within the specified range.
+    pub fn range<K: AsRef<[u8]> + Ord, R: RangeBounds<K>>(
+        &'_ self,
+        range: R,
+    ) -> Result<impl Iterator<Item = Result<(Bytes, Bytes)>> + '_> {
+        let start_bound = match range.start_bound() {
+            Bound::Included(v) => Bound::Included(v.as_ref()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end_bound = match range.end_bound() {
+            Bound::Included(v) => Bound::Included(v.as_ref()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let range = (start_bound, end_bound);
+        let disk_iter = self.dinner.range_keys_uncached(range)?.into_iter();
+        let cache_iter = self.cache.range::<[u8], _>(range).map(|v| v.0.clone());
+        let gen = Gen::new(|co| async move {
+            for key in itertools::merge(disk_iter, cache_iter) {
+                let value = self.get(&key);
+                match value {
+                    Err(e) => co.yield_(Err(e)).await,
+                    Ok(None) => continue,
+                    Ok(Some(val)) => co.yield_(Ok((key, val))).await,
+                }
+            }
+        });
+        Ok(gen.into_iter())
     }
 }
 
@@ -49,12 +187,21 @@ struct CacheEntry {
     pseudotime: AtomicU64,
 }
 
+impl CacheEntry {
+    fn new(value: Bytes) -> Self {
+        Self {
+            value,
+            pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
+        }
+    }
+}
+
 // Global pseudotime counter
 static GLOBAL_PSEUDO_TIME: AtomicU64 = AtomicU64::new(0);
 
 /// A non-clonable on-disk mapping
 struct DictInner {
-    cache: RwLock<HashMap<Bytes, CacheEntry>>,
+    cache: RwLock<BTreeMap<Bytes, CacheEntry>>,
     send_change: ManuallyDrop<Sender<SyncInstruction>>,
     thread_handle: Option<JoinHandle<Option<()>>>,
     low_level: Arc<LowLevel>,
@@ -62,6 +209,7 @@ struct DictInner {
     gc_threshold: usize,
 
     read_statement: String,
+    table_name: String,
 }
 
 impl Drop for DictInner {
@@ -78,11 +226,14 @@ impl DictInner {
         let thread_handle = {
             let table_name = table_name.to_string();
             let write_statement = format!("insert into {}(key, value) values ($1, $2) on conflict(key) do update set value = excluded.value", table_name);
+            let delete_statement = format!("delete from {} where key = $1", table_name);
             let low_level = low_level.clone();
             Some(
                 std::thread::Builder::new()
                     .name(format!("boringdb-{}", table_name))
-                    .spawn(move || sync_to_disk(recv_change, low_level, write_statement))
+                    .spawn(move || {
+                        sync_to_disk(recv_change, low_level, write_statement, delete_statement)
+                    })
                     .unwrap(),
             )
         };
@@ -93,29 +244,58 @@ impl DictInner {
             low_level,
             read_statement: format!("select value from {} where key = $1", table_name),
             gc_threshold: 100000,
+            table_name: table_name.to_string(),
         }
     }
 
     /// Maybe garbage collect
-    fn maybe_gc(&self) {
-        if nanorand::tls_rng().generate_range(0u32, 1000) == 0 {
+    fn maybe_gc(&self) -> Result<()> {
+        if nanorand::tls_rng().generate_range(0u32, 10000) == 0 {
             let mut cache = self.cache.write();
+
+            // we flush everything
+            self.flush()?;
+            assert_eq!(0, self.send_change.len());
+
             if cache.len() > self.gc_threshold {
                 log::debug!("garbage collect started!");
-                let oldest_allowed = GLOBAL_PSEUDO_TIME
-                    .load(Ordering::Relaxed)
-                    .saturating_sub((cache.len() * 9 / 10) as u64);
                 let old_len = cache.len();
-                cache.retain(|_, v| v.pseudotime.load(Ordering::Relaxed) >= oldest_allowed);
+                // TODO: LRU rather than randomly killing
+                let mut new = BTreeMap::new();
+                for (k, v) in cache.iter() {
+                    new.insert(k.clone(), CacheEntry::new(v.value.clone()));
+                }
+                *cache = new;
                 log::debug!("GC complete: {} => {}", old_len, cache.len());
             }
         }
+        Ok(())
+    }
+
+    /// Flushes to disk
+    fn flush(&self) -> Result<()> {
+        let (s, r) = flume::bounded(0);
+        self.send_change
+            .send(SyncInstruction::Flush(s))
+            .map_err(|_| DbError::WriteThreadFailed)?;
+        r.recv().map_err(|_| DbError::WriteThreadFailed)
+    }
+
+    /// Deletes a key.
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        let mut cache = self.cache.write();
+        cache.remove(key);
+        // we now signal the background thread
+        self.send_change
+            .send(SyncInstruction::Delete(Bytes::copy_from_slice(key)))
+            .map_err(|_| DbError::WriteThreadFailed)?;
+        Ok(())
     }
 
     /// Writes a key-value pair.
     fn write(&self, key: Bytes, value: Bytes) -> Result<()> {
         // first populate the cache
-        self.maybe_gc();
+        self.maybe_gc()?;
         let mut cache = self.cache.write();
         cache.insert(
             key.clone(),
@@ -124,18 +304,16 @@ impl DictInner {
                 pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
             },
         );
-        log::trace!("inserted {:?} => {:?} into cache", key, value);
         // we now signal the background thread
         self.send_change
             .send(SyncInstruction::Write(key, value))
             .map_err(|_| DbError::WriteThreadFailed)?;
-        log::trace!("send_change signalled");
         Ok(())
     }
 
     /// Reads, using the cache
     fn read(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.maybe_gc();
+        self.maybe_gc()?;
         let cache = self.cache.upgradable_read();
         // first we check the cache
         if let Some(res) = cache.get(key) {
@@ -147,18 +325,11 @@ impl DictInner {
             Ok(Some(value))
         } else {
             let value = self.read_uncached(key)?;
+            // try to upgrade to write lock. if we can't, that's okay too
             let cache = RwLockUpgradableReadGuard::try_upgrade(cache);
             if let Ok(mut cache) = cache {
                 if let Some(value) = value.as_ref() {
-                    cache.insert(
-                        Bytes::copy_from_slice(key),
-                        CacheEntry {
-                            value: value.clone(),
-                            pseudotime: AtomicU64::new(
-                                GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
-                            ),
-                        },
-                    );
+                    cache.insert(Bytes::copy_from_slice(key), CacheEntry::new(value.clone()));
                 }
             }
             Ok(value)
@@ -174,13 +345,90 @@ impl DictInner {
         })?;
         Ok(result.map(|v| v.into()))
     }
+
+    /// Gets all the keys, from the disk, within a range.
+    fn range_keys_uncached<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> Result<Vec<Bytes>> {
+        fn tovec(r: &Row) -> std::result::Result<Vec<u8>, rusqlite::Error> {
+            r.get::<_, Vec<u8>>(0)
+        }
+        Ok(self.low_level.transaction(|txn| {
+            let res: rusqlite::Result<Vec<Vec<u8>>> = match (range.start_bound(), range.end_bound())
+            {
+                (Bound::Included(start), Bound::Included(end)) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key >= $1 and key <= $2 ",
+                        self.table_name
+                    ))?
+                    .query_map(&[start, end], tovec)?
+                    .collect(),
+                (Bound::Included(start), Bound::Excluded(end)) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key >= $1 and key <  $2 ",
+                        self.table_name
+                    ))?
+                    .query_map(&[start, end], tovec)?
+                    .collect(),
+                (Bound::Included(start), Bound::Unbounded) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key >= $1 ",
+                        self.table_name
+                    ))?
+                    .query_map(&[start], tovec)?
+                    .collect(),
+                (Bound::Excluded(start), Bound::Included(end)) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key > $1 and key <= $2",
+                        self.table_name
+                    ))?
+                    .query_map(&[start, end], tovec)?
+                    .collect(),
+                (Bound::Excluded(start), Bound::Excluded(end)) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key > $1 and key < $2",
+                        self.table_name
+                    ))?
+                    .query_map(&[start, end], tovec)?
+                    .collect(),
+                (Bound::Excluded(start), Bound::Unbounded) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key > $1",
+                        self.table_name
+                    ))?
+                    .query_map(&[start], tovec)?
+                    .collect(),
+                (Bound::Unbounded, Bound::Included(end)) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key <= $1",
+                        self.table_name
+                    ))?
+                    .query_map(&[end], tovec)?
+                    .collect(),
+                (Bound::Unbounded, Bound::Excluded(end)) => txn
+                    .prepare_cached(&format!(
+                        "select key from {} where key < $1",
+                        self.table_name
+                    ))?
+                    .query_map(&[end], tovec)?
+                    .collect(),
+                (Bound::Unbounded, Bound::Unbounded) => txn
+                    .prepare_cached(&format!("select key from {}", self.table_name))?
+                    .query_map([], tovec)?
+                    .collect(),
+            };
+            let mut toret: Vec<Bytes> = Vec::new();
+            for row in res? {
+                toret.push(row.into());
+            }
+            Ok(toret)
+        })?)
+    }
 }
 
 /// A syncer instruction
 #[derive(Debug)]
 enum SyncInstruction {
     Flush(Sender<()>),
-    WriteBatch(Vec<(Bytes, Bytes)>),
+    WriteBatch(Vec<(Bytes, Option<Bytes>)>),
     Write(Bytes, Bytes),
     Delete(Bytes),
 }
@@ -189,6 +437,7 @@ fn sync_to_disk(
     recv_change: Receiver<SyncInstruction>,
     low_level: Arc<LowLevel>,
     write_statement: String,
+    delete_statement: String,
 ) -> Option<()> {
     // To prevent excessively bursty backpressure, we limit the amount of time spent within a transaction.
     // This is done through a TCP-like AIMD approach where we adjust the maximum batch size.
@@ -200,10 +449,10 @@ fn sync_to_disk(
     for batch_no in 0u64.. {
         instructions.push(recv_change.recv().ok()?);
         while let Ok(instr) = recv_change.try_recv() {
+            instructions.push(instr);
             if instructions.len() >= max_batch_size {
                 break;
             }
-            instructions.push(instr);
         }
         log::debug!(
             "[{}] sync_to_disk got {}/{} instructions",
@@ -211,19 +460,46 @@ fn sync_to_disk(
             instructions.len(),
             max_batch_size,
         );
+        if instructions.len() >= max_batch_size {
+            max_batch_size += 10;
+        }
+        let mut flush_buff = Vec::new();
+
+        // Writes
+        let mut writes: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
+        for instruction in instructions.drain(0..) {
+            match instruction {
+                SyncInstruction::Write(key, value) => {
+                    writes.insert(key, Some(value));
+                }
+                SyncInstruction::Delete(key) => {
+                    if writes.remove(&key).is_none() {
+                        writes.insert(key, None);
+                    }
+                }
+                SyncInstruction::Flush(flush) => flush_buff.push(flush),
+                SyncInstruction::WriteBatch(kvv) => {
+                    for (key, value) in kvv {
+                        writes.insert(key, value);
+                    }
+                }
+            }
+        }
+
         let tx_start_time = Instant::now();
         low_level
             .transaction(|txn| {
-                let mut write_statement = txn.prepare_cached(&write_statement)?;
-                for instruction in instructions.drain(0..) {
-                    match instruction {
-                        SyncInstruction::Write(key, value) => {
-                            write_statement.execute(&[&key[..], &value[..]])?;
+                {
+                    let mut write_statement = txn.prepare_cached(&write_statement)?;
+                    let mut delete_statement = txn.prepare_cached(&delete_statement)?;
+                    for (key, value) in writes {
+                        if let Some(value) = value {
+                            write_statement.execute(&[key.as_ref(), value.as_ref()])?;
+                        } else {
+                            delete_statement.execute(&[key.as_ref()])?;
                         }
-                        _ => todo!(),
                     }
                 }
-                drop(write_statement);
                 txn.commit()?;
                 Ok(())
             })
@@ -237,8 +513,9 @@ fn sync_to_disk(
         if elapsed > MAX_TX_TIME {
             max_batch_size = max_batch_size * 8 / 10;
         }
-        max_batch_size += 10;
-        // std::thread::sleep(Duration::from_millis(500));
+        for flush in flush_buff {
+            flush.send(()).ok()?;
+        }
     }
     unreachable!()
 }
