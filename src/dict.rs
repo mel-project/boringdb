@@ -38,7 +38,7 @@ impl Dict {
     }
 
     /// Delete a key.
-    pub fn remove(&self, key: &[u8]) -> Result<()> {
+    pub fn remove(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.inner.remove(key)
     }
 
@@ -282,14 +282,17 @@ impl DictInner {
     }
 
     /// Deletes a key.
-    fn remove(&self, key: &[u8]) -> Result<()> {
+    fn remove(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let mut cache = self.cache.write();
-        cache.remove(key);
+        let previous = match cache.remove(key) {
+            None => self.read_uncached(&key)?,
+            Some(val) => Some(val.value),
+        };
         // we now signal the background thread
         self.send_change
             .send(SyncInstruction::Delete(Bytes::copy_from_slice(key)))
             .map_err(|_| DbError::WriteThreadFailed)?;
-        Ok(())
+        Ok(previous)
     }
 
     /// Writes a key-value pair, returning the previous value
