@@ -1,6 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     mem::ManuallyDrop,
     ops::{Bound, RangeBounds},
     sync::{
@@ -135,10 +135,7 @@ impl<'a> Transaction<'a> {
             if res.deleted {
                 return Ok(None);
             }
-            res.pseudotime.store(
-                GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            res.update_pseudotime();
             let value = res.value.clone();
             Ok(Some(value))
         } else {
@@ -199,6 +196,17 @@ impl CacheEntry {
             deleted: false,
         }
     }
+
+    fn update_pseudotime(&self) {
+        self.pseudotime.store(
+            GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        )
+    }
+
+    fn get_pseudotime(&self) -> u64 {
+        self.pseudotime.load(Ordering::Relaxed)
+    }
 }
 
 // Global pseudotime counter
@@ -255,7 +263,7 @@ impl DictInner {
 
     /// Maybe garbage collect
     fn maybe_gc(&self) -> Result<()> {
-        if nanorand::tls_rng().generate_range(0u32, 10000) == 0 {
+        if nanorand::tls_rng().generate_range(0u32, 100000) == 0 {
             let mut cache = self.cache.write();
 
             // we flush everything
@@ -263,15 +271,23 @@ impl DictInner {
             assert_eq!(0, self.send_change.len());
 
             if cache.len() > self.gc_threshold {
-                log::debug!("garbage collect started!");
+                log::warn!("garbage collect started!");
                 let old_len = cache.len();
-                // TODO: LRU rather than randomly killing
+                // approximate LRU
+                let highest_time = GLOBAL_PSEUDO_TIME.load(Ordering::Relaxed);
+                let oldest_time = highest_time.saturating_sub((old_len / 2) as u64);
                 let mut new = BTreeMap::new();
+                let mut seen_pseudotimes = HashSet::new();
                 for (k, v) in cache.iter() {
-                    new.insert(k.clone(), CacheEntry::new(v.value.clone()));
+                    if !seen_pseudotimes.insert(v.get_pseudotime()) {
+                        panic!("duplicate pseudotime");
+                    }
+                    if !v.deleted && v.get_pseudotime() > oldest_time {
+                        new.insert(k.clone(), CacheEntry::new(v.value.clone()));
+                    }
                 }
                 *cache = new;
-                log::debug!("GC complete: {} => {}", old_len, cache.len());
+                log::warn!("GC complete: {} => {}", old_len, cache.len());
             }
         }
         Ok(())
@@ -338,10 +354,7 @@ impl DictInner {
                 if res.deleted {
                     return Ok(None);
                 }
-                res.pseudotime.store(
-                    GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
+                res.update_pseudotime();
                 let value = res.value.clone();
                 return Ok(Some(value));
             } else {
