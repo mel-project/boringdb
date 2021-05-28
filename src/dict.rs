@@ -282,7 +282,9 @@ impl DictInner {
                     if !seen_pseudotimes.insert(v.get_pseudotime()) {
                         panic!("duplicate pseudotime");
                     }
-                    if !v.deleted && v.get_pseudotime() > oldest_time {
+                    if !v.deleted && v.get_pseudotime() > oldest_time
+                        || nanorand::tls_rng().generate_range(0u8, 10) <= 5
+                    {
                         new.insert(k.clone(), CacheEntry::new(v.value.clone()));
                     }
                 }
