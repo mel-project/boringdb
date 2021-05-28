@@ -16,6 +16,7 @@ use crate::{low_level::LowLevel, DbError};
 use bytes::Bytes;
 use flume::{Receiver, Sender};
 use genawaiter::rc::Gen;
+use itertools::Itertools;
 use nanorand::RNG;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use rusqlite::{OptionalExtension, Row};
@@ -123,9 +124,11 @@ impl<'a> Transaction<'a> {
 
     /// Delete a key.
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
-        self.cache.remove(key.as_ref());
-        self.to_write
-            .push((Bytes::copy_from_slice(key.as_ref()), None));
+        if let Some(entry) = self.cache.get_mut(key.as_ref()) {
+            entry.deleted = true;
+            self.to_write
+                .push((Bytes::copy_from_slice(key.as_ref()), None));
+        }
         Ok(())
     }
 
@@ -166,9 +169,11 @@ impl<'a> Transaction<'a> {
         let range = (start_bound, end_bound);
         let disk_iter = self.dinner.range_keys_uncached(range)?.into_iter();
         let cache_iter = self.cache.range::<[u8], _>(range).map(|v| v.0.clone());
+        // are we sure these are sorted?
         let gen = Gen::new(|co| async move {
-            for key in itertools::merge(disk_iter, cache_iter) {
+            for key in itertools::merge(disk_iter, cache_iter).dedup() {
                 let value = self.get(&key);
+
                 match value {
                     Err(e) => co.yield_(Err(e)).await,
                     Ok(None) => continue,
@@ -282,8 +287,9 @@ impl DictInner {
                     if !seen_pseudotimes.insert(v.get_pseudotime()) {
                         panic!("duplicate pseudotime");
                     }
-                    if !v.deleted && v.get_pseudotime() > oldest_time
-                        || nanorand::tls_rng().generate_range(0u8, 10) <= 5
+                    if !v.deleted
+                        && (v.get_pseudotime() > oldest_time
+                            || nanorand::tls_rng().generate_range(0u8, 10) <= 5)
                     {
                         new.insert(k.clone(), CacheEntry::new(v.value.clone()));
                     }
@@ -308,7 +314,15 @@ impl DictInner {
     fn remove(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let mut cache = self.cache.write();
         let previous = match cache.get_mut(key) {
-            None => self.read_uncached(&key)?,
+            None => {
+                let val = self.read_uncached(&key)?;
+                if let Some(val) = val.as_ref() {
+                    let mut entry = CacheEntry::new(val.clone());
+                    entry.deleted = true;
+                    cache.insert(Bytes::copy_from_slice(key), entry);
+                }
+                val
+            }
             Some(val) => {
                 if val.deleted {
                     return Ok(None);
@@ -321,6 +335,7 @@ impl DictInner {
         self.send_change
             .send(SyncInstruction::Delete(Bytes::copy_from_slice(key)))
             .map_err(|_| DbError::WriteThreadFailed)?;
+        drop(cache);
         Ok(previous)
     }
 
@@ -343,6 +358,7 @@ impl DictInner {
         self.send_change
             .send(SyncInstruction::Write(key, value))
             .map_err(|_| DbError::WriteThreadFailed)?;
+        drop(cache);
         Ok(actual_previous)
     }
 
@@ -458,6 +474,9 @@ impl DictInner {
             for row in res? {
                 toret.push(row.into());
             }
+            for pair in toret.windows(2) {
+                assert!(pair[0] < pair[1]);
+            }
             Ok(toret)
         })?)
     }
@@ -509,15 +528,15 @@ fn sync_to_disk(
 
         // Writes
         let mut writes: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
-        for instruction in instructions.drain(0..) {
+        for instruction in instructions.drain(..) {
             match instruction {
                 SyncInstruction::Write(key, value) => {
                     writes.insert(key, Some(value));
                 }
                 SyncInstruction::Delete(key) => {
-                    if writes.remove(&key).is_none() {
-                        writes.insert(key, None);
-                    }
+                    // if writes.remove(&key).is_none() {
+                    writes.insert(key, None);
+                    // }
                 }
                 SyncInstruction::Flush(flush) => flush_buff.push(flush),
                 SyncInstruction::WriteBatch(kvv) => {

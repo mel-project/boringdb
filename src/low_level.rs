@@ -16,8 +16,9 @@ impl LowLevel {
         connection.query_row("PRAGMA locking_mode = EXCLUSIVE;", [], |f| {
             f.get::<_, String>(0)
         })?;
+        // connection.query_row("PRAGMA journal_mode = WAL;", [], |f| f.get::<_, String>(0))?;
         // memory-mapped I/O
-        connection.query_row("PRAGMA mmap_size=268435456;", [], |f| f.get::<_, i32>(0))?;
+        connection.query_row("PRAGMA mmap_size=1073741824;", [], |f| f.get::<_, i32>(0))?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
