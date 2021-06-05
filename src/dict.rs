@@ -1,6 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     mem::ManuallyDrop,
     ops::{Bound, RangeBounds},
     sync::{
@@ -18,7 +18,8 @@ use flume::{Receiver, Sender};
 use genawaiter::rc::Gen;
 use itertools::Itertools;
 use nanorand::RNG;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use priority_queue::PriorityQueue;
 use rusqlite::{OptionalExtension, Row};
 
 /// A clonable on-disk mapping, corresponding to a table in SQLite
@@ -81,6 +82,7 @@ impl Dict {
             send_change: &self.inner.send_change,
             cache,
             read_uncached: Box::new(move |val| self.inner.read_uncached(val)),
+            cache_priorities: &self.inner.cache_priorities,
             dinner: &self.inner,
             to_write: Default::default(),
         };
@@ -99,6 +101,7 @@ impl Dict {
 pub struct Transaction<'a> {
     send_change: &'a Sender<SyncInstruction>,
     cache: RwLockWriteGuard<'a, BTreeMap<Bytes, CacheEntry>>,
+    cache_priorities: &'a Mutex<PriorityQueue<Bytes, u64>>,
     to_write: Vec<(Bytes, Option<Bytes>)>,
     dinner: &'a DictInner,
     read_uncached: Box<dyn Fn(&[u8]) -> Result<Option<Bytes>> + 'a>,
@@ -106,9 +109,10 @@ pub struct Transaction<'a> {
 
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
-        let _ = self
-            .send_change
-            .send(SyncInstruction::WriteBatch(self.to_write.clone()));
+        let _ = throttled_send(
+            &self.send_change,
+            SyncInstruction::WriteBatch(self.to_write.clone()),
+        );
     }
 }
 
@@ -118,6 +122,9 @@ impl<'a> Transaction<'a> {
         let key: Bytes = key.into();
         let val: Bytes = val.into();
         self.cache.insert(key.clone(), CacheEntry::new(val.clone()));
+        self.cache_priorities
+            .lock()
+            .push(key.clone(), get_pseudotime());
         self.to_write.push((key, Some(val)));
         Ok(())
     }
@@ -138,7 +145,6 @@ impl<'a> Transaction<'a> {
             if res.deleted {
                 return Ok(None);
             }
-            res.update_pseudotime();
             let value = res.value.clone();
             Ok(Some(value))
         } else {
@@ -189,7 +195,6 @@ impl<'a> Transaction<'a> {
 #[derive(Debug)]
 struct CacheEntry {
     value: Bytes,
-    pseudotime: AtomicU64,
     deleted: bool,
 }
 
@@ -197,29 +202,22 @@ impl CacheEntry {
     fn new(value: Bytes) -> Self {
         Self {
             value,
-            pseudotime: AtomicU64::new(GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)),
             deleted: false,
         }
-    }
-
-    fn update_pseudotime(&self) {
-        self.pseudotime.store(
-            GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed),
-            Ordering::Relaxed,
-        )
-    }
-
-    fn get_pseudotime(&self) -> u64 {
-        self.pseudotime.load(Ordering::Relaxed)
     }
 }
 
 // Global pseudotime counter
 static GLOBAL_PSEUDO_TIME: AtomicU64 = AtomicU64::new(0);
 
+fn get_pseudotime() -> u64 {
+    GLOBAL_PSEUDO_TIME.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A non-clonable on-disk mapping
 struct DictInner {
     cache: RwLock<BTreeMap<Bytes, CacheEntry>>,
+    cache_priorities: Mutex<PriorityQueue<Bytes, u64>>,
     send_change: ManuallyDrop<Sender<SyncInstruction>>,
     thread_handle: Option<JoinHandle<Option<()>>>,
     low_level: Arc<LowLevel>,
@@ -237,10 +235,17 @@ impl Drop for DictInner {
     }
 }
 
+fn throttled_send<T>(sender: &Sender<T>, val: T) -> std::result::Result<(), flume::SendError<T>> {
+    // TODO something better
+    // let throttle = Duration::from_secs_f64(-(100.0 / ((sender.len() as f64) - 10000.0)) - 0.01);
+    // std::thread::sleep(throttle);
+    sender.send(val)
+}
+
 impl DictInner {
     /// Create a new map iner.
     fn new(low_level: Arc<LowLevel>, table_name: &str) -> Self {
-        let (send_change, recv_change) = flume::bounded(5000);
+        let (send_change, recv_change) = flume::bounded(10000);
         let thread_handle = {
             let table_name = table_name.to_string();
             let write_statement = format!("insert into {}(key, value) values ($1, $2) on conflict(key) do update set value = excluded.value", table_name);
@@ -257,45 +262,40 @@ impl DictInner {
         };
         Self {
             cache: Default::default(),
+            cache_priorities: Default::default(),
             send_change: ManuallyDrop::new(send_change),
             thread_handle,
             low_level,
             read_statement: format!("select value from {} where key = $1", table_name),
-            gc_threshold: 100000,
+            gc_threshold: 10000,
             table_name: table_name.to_string(),
         }
     }
 
     /// Maybe garbage collect
     fn maybe_gc(&self) -> Result<()> {
-        if nanorand::tls_rng().generate_range(0u32, 100000) == 0 {
-            let mut cache = self.cache.write();
-
-            // we flush everything
-            self.flush()?;
-            assert_eq!(0, self.send_change.len());
-
+        if nanorand::tls_rng().generate_range(0u32, 1000) == 0 {
+            let cache = self.cache.upgradable_read();
+            let old_len = cache.len();
             if cache.len() > self.gc_threshold {
-                log::warn!("garbage collect started!");
-                let old_len = cache.len();
-                // approximate LRU
-                let highest_time = GLOBAL_PSEUDO_TIME.load(Ordering::Relaxed);
-                let oldest_time = highest_time.saturating_sub((old_len / 2) as u64);
-                let mut new = BTreeMap::new();
-                let mut seen_pseudotimes = HashSet::new();
-                for (k, v) in cache.iter() {
-                    if !seen_pseudotimes.insert(v.get_pseudotime()) {
-                        panic!("duplicate pseudotime");
+                if let Ok(mut cache) = RwLockUpgradableReadGuard::try_upgrade(cache) {
+                    // we flush everything
+                    self.flush()?;
+                    assert_eq!(0, self.send_change.len());
+                    let mut priorities = self.cache_priorities.lock();
+                    log::warn!("garbage collect started! {} priorities", priorities.len());
+                    while let Some((k, _)) = priorities.pop() {
+                        cache.remove(&k);
+                        if cache.len() < self.gc_threshold / 2 {
+                            break;
+                        }
                     }
-                    if !v.deleted
-                        && (v.get_pseudotime() > oldest_time
-                            || nanorand::tls_rng().generate_range(0u8, 10) <= 5)
-                    {
-                        new.insert(k.clone(), CacheEntry::new(v.value.clone()));
+                    if cache.len() > self.gc_threshold / 2 {
+                        log::warn!("** LRU failed to get the cache size under control? Killing everything just because**");
+                        cache.clear();
                     }
+                    log::warn!("GC complete: {} => {}", old_len, cache.len());
                 }
-                *cache = new;
-                log::warn!("GC complete: {} => {}", old_len, cache.len());
             }
         }
         Ok(())
@@ -304,8 +304,7 @@ impl DictInner {
     /// Flushes to disk
     fn flush(&self) -> Result<()> {
         let (s, r) = flume::bounded(0);
-        self.send_change
-            .send(SyncInstruction::Flush(s))
+        throttled_send(&self.send_change, SyncInstruction::Flush(s))
             .map_err(|_| DbError::WriteThreadFailed)?;
         r.recv().map_err(|_| DbError::WriteThreadFailed)
     }
@@ -332,9 +331,11 @@ impl DictInner {
             }
         };
         // we now signal the background thread
-        self.send_change
-            .send(SyncInstruction::Delete(Bytes::copy_from_slice(key)))
-            .map_err(|_| DbError::WriteThreadFailed)?;
+        throttled_send(
+            &self.send_change,
+            SyncInstruction::Delete(Bytes::copy_from_slice(key)),
+        )
+        .map_err(|_| DbError::WriteThreadFailed)?;
         drop(cache);
         Ok(previous)
     }
@@ -355,39 +356,47 @@ impl DictInner {
             None => self.read_uncached(&key)?,
             Some(val) => Some(val),
         };
-        self.send_change
-            .send(SyncInstruction::Write(key, value))
-            .map_err(|_| DbError::WriteThreadFailed)?;
+
+        throttled_send(
+            &self.send_change,
+            SyncInstruction::Write(key.clone(), value),
+        )
+        .map_err(|_| DbError::WriteThreadFailed)?;
         drop(cache);
+
+        self.cache_priorities.lock().push(key, get_pseudotime());
         Ok(actual_previous)
     }
 
     /// Reads, using the cache
     fn read(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.maybe_gc()?;
-        loop {
-            let cache = self.cache.upgradable_read();
-            // first we check the cache
-            if let Some(res) = cache.get(key) {
-                if res.deleted {
-                    return Ok(None);
-                }
-                res.update_pseudotime();
-                let value = res.value.clone();
-                return Ok(Some(value));
-            } else {
-                let value = self.read_uncached(key)?;
-                // try to upgrade to write lock. if we can't, that's okay too
-                let cache = RwLockUpgradableReadGuard::try_upgrade(cache);
-                if let Ok(mut cache) = cache {
-                    if let Some(value) = value.as_ref() {
-                        cache.insert(Bytes::copy_from_slice(key), CacheEntry::new(value.clone()));
-                    }
-                } else {
-                    continue;
-                }
-                return Ok(value);
+        let cache = self.cache.upgradable_read();
+        // first we check the cache
+        if let Some((key, res)) = cache.get_key_value(key) {
+            if res.deleted {
+                return Ok(None);
             }
+            let value = res.value.clone();
+            if nanorand::tls_rng().generate_range(0usize, 100) == 0 {
+                self.cache_priorities
+                    .lock()
+                    .push(key.clone(), get_pseudotime());
+            }
+            Ok(Some(value))
+        } else {
+            let value = self.read_uncached(key)?;
+            // try to upgrade to write lock. if we can't, that's okay too
+            let cache = RwLockUpgradableReadGuard::try_upgrade(cache);
+            if let Ok(mut cache) = cache {
+                let key = Bytes::copy_from_slice(key);
+                if let Some(value) = value.as_ref() {
+                    cache.insert(key.clone(), CacheEntry::new(value.clone()));
+                }
+                drop(cache);
+                self.cache_priorities.lock().push(key, get_pseudotime());
+            }
+            Ok(value)
         }
     }
 
@@ -499,7 +508,7 @@ fn sync_to_disk(
 ) -> Option<()> {
     // To prevent excessively bursty backpressure, we limit the amount of time spent within a transaction.
     // This is done through a TCP-like AIMD approach where we adjust the maximum batch size.
-    const MAX_TX_TIME: Duration = Duration::from_millis(200);
+    const MAX_TX_TIME: Duration = Duration::from_millis(1000);
     let mut max_batch_size = 100;
 
     log::debug!("sync_to_disk started");
@@ -522,7 +531,7 @@ fn sync_to_disk(
         // continue;
 
         if instructions.len() >= max_batch_size {
-            max_batch_size += 10;
+            max_batch_size += (max_batch_size / 10).max(10);
         }
         let mut flush_buff = Vec::new();
 

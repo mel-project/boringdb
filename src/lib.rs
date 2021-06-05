@@ -46,7 +46,7 @@ mod tests {
         init_logs();
         let database = Database::open("/tmp/labooyah.db").unwrap();
         let dict = database.open_dict("labooyah").unwrap();
-        for _ in 0..100 {
+        for _ in 0..1000000 {
             let key = format!(
                 "hello world {}",
                 nanorand::tls_rng().generate_range(0, u64::MAX)
