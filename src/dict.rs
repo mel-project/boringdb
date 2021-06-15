@@ -267,14 +267,14 @@ impl DictInner {
             thread_handle,
             low_level,
             read_statement: format!("select value from {} where key = $1", table_name),
-            gc_threshold: 10000,
+            gc_threshold: 1000000,
             table_name: table_name.to_string(),
         }
     }
 
     /// Maybe garbage collect
     fn maybe_gc(&self) -> Result<()> {
-        if nanorand::tls_rng().generate_range(0u32, 1000) == 0 {
+        if nanorand::tls_rng().generate_range(0u32, 100000) == 0 {
             let cache = self.cache.upgradable_read();
             let old_len = cache.len();
             if cache.len() > self.gc_threshold {
@@ -282,19 +282,20 @@ impl DictInner {
                     // we flush everything
                     self.flush()?;
                     assert_eq!(0, self.send_change.len());
-                    let mut priorities = self.cache_priorities.lock();
-                    log::warn!("garbage collect started! {} priorities", priorities.len());
-                    while let Some((k, _)) = priorities.pop() {
-                        cache.remove(&k);
-                        if cache.len() < self.gc_threshold / 2 {
-                            break;
+                    if let Some(mut priorities) = self.cache_priorities.try_lock() {
+                        log::warn!("garbage collect started! {} priorities", priorities.len());
+                        while let Some((k, _)) = priorities.pop() {
+                            cache.remove(&k);
+                            if cache.len() < self.gc_threshold / 2 {
+                                break;
+                            }
                         }
+                        if cache.len() > self.gc_threshold / 2 {
+                            log::warn!("** LRU failed to get the cache size under control? Killing everything just because**");
+                            cache.clear();
+                        }
+                        log::warn!("GC complete: {} => {}", old_len, cache.len());
                     }
-                    if cache.len() > self.gc_threshold / 2 {
-                        log::warn!("** LRU failed to get the cache size under control? Killing everything just because**");
-                        cache.clear();
-                    }
-                    log::warn!("GC complete: {} => {}", old_len, cache.len());
                 }
             }
         }
