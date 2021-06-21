@@ -245,7 +245,7 @@ fn throttled_send<T>(sender: &Sender<T>, val: T) -> std::result::Result<(), flum
 impl DictInner {
     /// Create a new map iner.
     fn new(low_level: Arc<LowLevel>, table_name: &str) -> Self {
-        let (send_change, recv_change) = flume::bounded(10000);
+        let (send_change, recv_change) = flume::bounded(20000);
         let thread_handle = {
             let table_name = table_name.to_string();
             let write_statement = format!("insert into {}(key, value) values ($1, $2) on conflict(key) do update set value = excluded.value", table_name);
@@ -509,14 +509,15 @@ fn sync_to_disk(
 ) -> Option<()> {
     // To prevent excessively bursty backpressure, we limit the amount of time spent within a transaction.
     // This is done through a TCP-like AIMD approach where we adjust the maximum batch size.
-    const MAX_TX_TIME: Duration = Duration::from_millis(1000);
+    const MAX_TX_TIME: Duration = Duration::from_millis(500);
     let mut max_batch_size = 100;
 
     log::debug!("sync_to_disk started");
     let mut instructions = Vec::new();
     for batch_no in 0u64.. {
         instructions.push(recv_change.recv().ok()?);
-        while let Ok(instr) = recv_change.try_recv() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while let Ok(instr) = recv_change.recv_deadline(deadline) {
             instructions.push(instr);
             if instructions.len() >= max_batch_size {
                 break;
@@ -587,8 +588,6 @@ fn sync_to_disk(
         for flush in flush_buff {
             flush.send(()).ok()?;
         }
-        // at least sleep 50ms
-        std::thread::sleep(Duration::from_millis(50));
     }
     unreachable!()
 }

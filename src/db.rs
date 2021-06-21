@@ -21,7 +21,7 @@ impl Database {
         self.low_level.transaction(|txn| {
             txn.execute(
                 &format!(
-                    "create table if not exists {} (key BLOB PRIMARY KEY, value BLOB NOT NULL)",
+                    "create table if not exists {} (key BLOB PRIMARY KEY, value BLOB NOT NULL) without rowid",
                     name
                 ),
                 [],
