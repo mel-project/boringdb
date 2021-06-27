@@ -267,7 +267,7 @@ impl DictInner {
             thread_handle,
             low_level,
             read_statement: format!("select value from {} where key = $1", table_name),
-            gc_threshold: 1000000,
+            gc_threshold: 100000,
             table_name: table_name.to_string(),
         }
     }
