@@ -19,7 +19,7 @@ jobs:
       - name: Update Apt
         run: sudo apt update
       - name: Install Musl
-        run: sudo apt -y install musl musl-tools
+        run: sudo apt -y install musl musl-tools sqlite3
       - name: Add Musl Target Triple
         run: rustup target add x86_64-unknown-linux-musl
       - name: Run tests
