@@ -19,7 +19,7 @@ impl LowLevel {
         // connection.query_row("PRAGMA journal_mode = WAL;", [], |f| f.get::<_, String>(0))?;
         // connection.execute("PRAGMA synchronous = NORMAL;", [])?;
         // memory-mapped I/O
-        // connection.query_row("PRAGMA mmap_size=1073741824;", [], |f| f.get::<_, i32>(0))?;
+        connection.query_row("PRAGMA mmap_size=1073741824;", [], |f| f.get::<_, i32>(0))?;
         Ok(Self {
             connection: Mutex::new(connection),
         })

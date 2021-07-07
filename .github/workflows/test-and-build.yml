@@ -1,0 +1,28 @@
+name: TestAndBuild
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Update Apt
+        run: sudo apt update
+      - name: Install Musl
+        run: sudo apt -y install musl musl-tools
+      - name: Add Musl Target Triple
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Run tests
+        run: cargo test --target x86_64-unknown-linux-musl --verbose
+      - name: Build (Musl)
+        run: cargo build --target x86_64-unknown-linux-musl --verbose
