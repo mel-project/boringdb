@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::Result;
+use crate::types::BoringResult;
 use crate::{low_level::LowLevel, DbError};
 use bytes::Bytes;
 use flume::{Receiver, Sender};
@@ -30,17 +30,17 @@ pub struct Dict {
 
 impl Dict {
     /// Gets a key/value pair.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get(&self, key: &[u8]) -> BoringResult<Option<Bytes>> {
         self.inner.read(key)
     }
 
     /// Inserts a key/value pair.
-    pub fn insert(&self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> Result<Option<Bytes>> {
+    pub fn insert(&self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> BoringResult<Option<Bytes>> {
         self.inner.write(key.into(), val.into())
     }
 
     /// Delete a key.
-    pub fn remove(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn remove(&self, key: &[u8]) -> BoringResult<Option<Bytes>> {
         self.inner.remove(key)
     }
 
@@ -57,7 +57,7 @@ impl Dict {
     pub fn range<'a, K: AsRef<[u8]> + Ord + 'a, R: RangeBounds<K> + 'a>(
         &'a self,
         range: R,
-    ) -> Result<impl Iterator<Item = Result<(Bytes, Bytes)>> + 'a> {
+    ) -> BoringResult<impl Iterator<Item = BoringResult<(Bytes, Bytes)>> + 'a> {
         let tx = self.transaction()?;
         let gen = Gen::new(move |co| async move {
             let it = tx.range(range);
@@ -76,7 +76,7 @@ impl Dict {
     }
 
     /// Runs a transaction. This is NOT optimistic, but rather locking, so care should be taken to avoid long-running transactions.
-    pub fn transaction(&'_ self) -> Result<Transaction<'_>> {
+    pub fn transaction(&'_ self) -> BoringResult<Transaction<'_>> {
         let cache = self.inner.cache.write();
         let txn = Transaction {
             send_change: &self.inner.send_change,
@@ -92,7 +92,7 @@ impl Dict {
     /// Flushes to disk. Guarantees that all operations that happens before the call reaches disk before this call terminates.
     ///
     /// **Note**: This can be very slow, especially after a large number of writes. Calling this function is not needed for atomicity or crash-safety, but only when you want to absolutely prevent the database from traveling "back in time" a few seconds in case of a crash. Usually this is only needed if you e.g. want to store a reference to an object in this boringdb database in some other database, and you cannot tolerate "dangling pointers".
-    pub fn flush(&self) -> Result<()> {
+    pub fn flush(&self) -> BoringResult<()> {
         self.inner.flush()
     }
 }
@@ -104,7 +104,7 @@ pub struct Transaction<'a> {
     cache_priorities: &'a Mutex<PriorityQueue<Bytes, u64>>,
     to_write: Vec<(Bytes, Option<Bytes>)>,
     dinner: &'a DictInner,
-    read_uncached: Box<dyn Fn(&[u8]) -> Result<Option<Bytes>> + 'a>,
+    read_uncached: Box<dyn Fn(&[u8]) -> BoringResult<Option<Bytes>> + 'a>,
 }
 
 impl<'a> Drop for Transaction<'a> {
@@ -118,7 +118,7 @@ impl<'a> Drop for Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     /// Inserts a key/value pair.
-    pub fn insert(&mut self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> Result<()> {
+    pub fn insert(&mut self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> BoringResult<()> {
         let key: Bytes = key.into();
         let val: Bytes = val.into();
         self.cache.insert(key.clone(), CacheEntry::new(val.clone()));
@@ -130,7 +130,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Delete a key.
-    pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Result<()> {
+    pub fn remove(&mut self, key: impl AsRef<[u8]>) -> BoringResult<()> {
         if let Some(entry) = self.cache.get_mut(key.as_ref()) {
             entry.deleted = true;
             self.to_write
@@ -140,7 +140,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Gets a key/value pair.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get(&self, key: &[u8]) -> BoringResult<Option<Bytes>> {
         if let Some(res) = self.cache.get(key) {
             if res.deleted {
                 return Ok(None);
@@ -161,7 +161,7 @@ impl<'a> Transaction<'a> {
     pub fn range<K: AsRef<[u8]> + Ord, R: RangeBounds<K>>(
         &'_ self,
         range: R,
-    ) -> Result<impl Iterator<Item = Result<(Bytes, Bytes)>> + '_> {
+    ) -> BoringResult<impl Iterator<Item = BoringResult<(Bytes, Bytes)>> + '_> {
         let start_bound = match range.start_bound() {
             Bound::Included(v) => Bound::Included(v.as_ref()),
             Bound::Excluded(v) => Bound::Excluded(v.as_ref()),
@@ -235,7 +235,7 @@ impl Drop for DictInner {
     }
 }
 
-fn throttled_send<T>(sender: &Sender<T>, val: T) -> std::result::Result<(), flume::SendError<T>> {
+fn throttled_send<T>(sender: &Sender<T>, val: T) -> Result<(), flume::SendError<T>> {
     // TODO something better
     // let throttle = Duration::from_secs_f64(-(100.0 / ((sender.len() as f64) - 10000.0)) - 0.01);
     // std::thread::sleep(throttle);
@@ -273,7 +273,7 @@ impl DictInner {
     }
 
     /// Maybe garbage collect
-    fn maybe_gc(&self) -> Result<()> {
+    fn maybe_gc(&self) -> BoringResult<()> {
         if nanorand::tls_rng().generate_range(0u32..=100000) == 0 {
             let cache = self.cache.upgradable_read();
             let old_len = cache.len();
@@ -303,7 +303,7 @@ impl DictInner {
     }
 
     /// Flushes to disk
-    fn flush(&self) -> Result<()> {
+    fn flush(&self) -> BoringResult<()> {
         let (s, r) = flume::bounded(0);
         throttled_send(&self.send_change, SyncInstruction::Flush(s))
             .map_err(|_| DbError::WriteThreadFailed)?;
@@ -311,7 +311,7 @@ impl DictInner {
     }
 
     /// Deletes a key.
-    fn remove(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    fn remove(&self, key: &[u8]) -> BoringResult<Option<Bytes>> {
         let mut cache = self.cache.write();
         let previous = match cache.get_mut(key) {
             None => {
@@ -342,7 +342,7 @@ impl DictInner {
     }
 
     /// Writes a key-value pair, returning the previous value
-    fn write(&self, key: Bytes, value: Bytes) -> Result<Option<Bytes>> {
+    fn write(&self, key: Bytes, value: Bytes) -> BoringResult<Option<Bytes>> {
         // first populate the cache
         self.maybe_gc()?;
         let mut cache = self.cache.write();
@@ -370,7 +370,7 @@ impl DictInner {
     }
 
     /// Reads, using the cache
-    fn read(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    fn read(&self, key: &[u8]) -> BoringResult<Option<Bytes>> {
         self.maybe_gc()?;
         let cache = self.cache.upgradable_read();
         // first we check the cache
@@ -402,7 +402,7 @@ impl DictInner {
     }
 
     /// Reads, bypassing the cache
-    fn read_uncached(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    fn read_uncached(&self, key: &[u8]) -> BoringResult<Option<Bytes>> {
         let read_statement = self.read_statement.clone();
         let result: Option<Vec<u8>> = self.low_level.transaction(move |txn| {
             let mut stmt = txn.prepare_cached(&read_statement)?;
@@ -412,8 +412,8 @@ impl DictInner {
     }
 
     /// Gets all the keys, from the disk, within a range.
-    fn range_keys_uncached<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> Result<Vec<Bytes>> {
-        fn tovec(r: &Row) -> std::result::Result<Vec<u8>, rusqlite::Error> {
+    fn range_keys_uncached<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> BoringResult<Vec<Bytes>> {
+        fn tovec(r: &Row) -> Result<Vec<u8>, rusqlite::Error> {
             r.get::<_, Vec<u8>>(0)
         }
         Ok(self.low_level.transaction(|txn| {

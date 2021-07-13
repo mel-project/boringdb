@@ -8,9 +8,11 @@
 // ! To avoid this behavior, use the [Dict::flush] method to manually force synchronization with disk. Note that this comes with a fairly severe performance cost.
 
 mod dict;
-mod low_level;
-pub use dict::*;
 mod db;
+mod low_level;
+mod types;
+
+pub use dict::*;
 pub use db::*;
 
 use thiserror::Error;
@@ -24,42 +26,52 @@ pub enum DbError {
     WriteThreadFailed,
 }
 
-/// Result type used throughout the codebase.
-pub type Result<T> = std::result::Result<T, DbError>;
-
 #[cfg(test)]
 mod tests {
     use std::convert::TryInto;
+    use std::ops::Range;
 
     use easy_parallel::Parallel;
+    use env_logger::Env;
+    use log::{debug, SetLoggerError};
     use nanorand::Rng;
 
-    use env_logger::Env;
 
     use super::*;
     fn init_logs() {
-        let _ = env_logger::Builder::from_env(Env::default().default_filter_or("boringdb=debug"))
+        let initialise_logs: Result<(), SetLoggerError> = env_logger::Builder::from_env(Env::default().default_filter_or("boringdb=debug"))
             .try_init();
+
+        match initialise_logs {
+            Ok(_) => debug!("Logging initialised successfully."),
+            Err(error) => eprintln!("Error with logs: {}", error),
+        }
     }
     #[test]
     fn simple_writes() {
         init_logs();
-        let database = Database::open("/tmp/labooyah.db").unwrap();
-        let dict = database.open_dict("labooyah").unwrap();
-        for _ in 0..1000 {
-            let key = format!(
+
+        let database: Database = Database::open("/tmp/labooyah.db").expect(" Could not open test database.");
+        let dict: Dict = database.open_dict("labooyah").expect("Could not open dictionary.");
+
+        let range: Range<i32> = 0..1000;
+
+        range.into_iter().for_each(|_unused_count| {
+            let key: String = format!(
                 "hello world {}",
                 nanorand::tls_rng().generate_range(0..=u64::MAX)
             );
+
             dict.insert(key.as_bytes().to_vec(), b"oh no".as_ref())
-                .unwrap();
+                .expect("Could not insert into dictionary.");
             // log::info!("inserted {}", i);
             // log::info!("got {:?}", dict.get(key.as_bytes()).unwrap().unwrap());
             assert_eq!(
                 dict.get(key.as_bytes()).unwrap().unwrap().as_ref(),
                 b"oh no"
             );
-        }
+        });
+
     }
     #[test]
     fn transactional_increment() {
@@ -68,11 +80,14 @@ mod tests {
         const THREADS: u64 = 100;
         const INCREMENTS: u64 = 100;
         {
-            let database = Database::open("/tmp/transactions.db").unwrap();
-            let dict = database.open_dict("labooyah").unwrap();
+            let database: Database = Database::open("/tmp/transactions.db").expect(" Could not open test database.");
+            let dict: Dict = database.open_dict("labooyah").expect("Could not open dictionary.");
             dict.insert(b"counter".to_vec(), 0u64.to_be_bytes().to_vec())
-                .unwrap();
-            let mut parallel = Parallel::new();
+                .expect("Could not insert into dictionary.");
+
+            let mut parallel: Parallel<()> = Parallel::new();
+
+            // let range: Range<u64> = 0..THREADS;
 
             for _ in 0..THREADS {
                 parallel = parallel.add(|| {
