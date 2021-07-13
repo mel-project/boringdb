@@ -17,7 +17,7 @@ use bytes::Bytes;
 use flume::{Receiver, Sender};
 use genawaiter::rc::Gen;
 use itertools::Itertools;
-use nanorand::RNG;
+use nanorand::Rng;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use priority_queue::PriorityQueue;
 use rusqlite::{OptionalExtension, Row};
@@ -274,7 +274,7 @@ impl DictInner {
 
     /// Maybe garbage collect
     fn maybe_gc(&self) -> Result<()> {
-        if nanorand::tls_rng().generate_range(0u32, 100000) == 0 {
+        if nanorand::tls_rng().generate_range(0u32..=100000) == 0 {
             let cache = self.cache.upgradable_read();
             let old_len = cache.len();
             if cache.len() > self.gc_threshold {
@@ -379,7 +379,7 @@ impl DictInner {
                 return Ok(None);
             }
             let value = res.value.clone();
-            if nanorand::tls_rng().generate_range(0usize, 100) == 0 {
+            if nanorand::tls_rng().generate_range(0usize..=100) == 0 {
                 self.cache_priorities
                     .lock()
                     .push(key.clone(), get_pseudotime());

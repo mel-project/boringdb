@@ -32,7 +32,7 @@ mod tests {
     use std::convert::TryInto;
 
     use easy_parallel::Parallel;
-    use nanorand::RNG;
+    use nanorand::Rng;
 
     use env_logger::Env;
 
@@ -49,7 +49,7 @@ mod tests {
         for _ in 0..1000 {
             let key = format!(
                 "hello world {}",
-                nanorand::tls_rng().generate_range(0, u64::MAX)
+                nanorand::tls_rng().generate_range(0..=u64::MAX)
             );
             dict.insert(key.as_bytes().to_vec(), b"oh no".as_ref())
                 .unwrap();
