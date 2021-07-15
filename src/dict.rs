@@ -429,11 +429,11 @@ impl DictInner {
             field1: &str,
             comparator: &str,
             field2: &str,
-        ) -> String {
+        ) -> Option<String> {
             match bound {
-                Bound::Included(_) => format!("{} {}= {}", field1, comparator, field2),
-                Bound::Excluded(_) => format!("{} {} {}", field1, comparator, field2),
-                Bound::Unbounded => String::from(""),
+                Bound::Included(_) => Some(format!("{} {}= {}", field1, comparator, field2)),
+                Bound::Excluded(_) => Some(format!("{} {} {}", field1, comparator, field2)),
+                Bound::Unbounded => None,
             }
         }
         fn push_params<T>(params: &mut Vec<T>, bound: Bound<T>) {
@@ -444,10 +444,10 @@ impl DictInner {
             }
         }
         Ok(self.low_level.transaction(|txn| {
-            let statements = vec![
+            let statements: Vec<String> = vec![
                 bound_to_string(range.start_bound(), "key", ">", "$1"),
                 bound_to_string(range.end_bound(), "key", "<", "$2"),
-            ];
+            ].into_iter().flatten().collect();
             let select = format!(
                 "select key from {} where {}",
                 self.table_name,
