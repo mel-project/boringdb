@@ -22,6 +22,14 @@ use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use priority_queue::PriorityQueue;
 use rusqlite::{OptionalExtension, Row};
 
+fn bound_to_string(bound: Bound<&&[u8]>, field1: &str, comparator: &str, field2: &str) -> String {
+    match bound {
+        Bound::Included(_) => format!("{} {}= {}", field1, comparator, field2),
+        Bound::Excluded(_) => format!("{} {} {}", field1, comparator, field2),
+        Bound::Unbounded => String::from(""),
+    }
+}
+
 /// A clonable on-disk mapping, corresponding to a table in SQLite
 #[derive(Clone)]
 pub struct Dict {
@@ -416,70 +424,45 @@ impl DictInner {
         fn tovec(r: &Row) -> std::result::Result<Vec<u8>, rusqlite::Error> {
             r.get::<_, Vec<u8>>(0)
         }
+        fn bound_to_string<T>(
+            bound: Bound<T>,
+            field1: &str,
+            comparator: &str,
+            field2: &str,
+        ) -> String {
+            match bound {
+                Bound::Included(_) => format!("{} {}= {}", field1, comparator, field2),
+                Bound::Excluded(_) => format!("{} {} {}", field1, comparator, field2),
+                Bound::Unbounded => String::from(""),
+            }
+        }
+        fn push_params<T>(params: &mut Vec<T>, bound: Bound<T>) {
+            match bound {
+                Bound::Included(start) => params.push(start),
+                Bound::Excluded(end) => params.push(end),
+                Bound::Unbounded => (),
+            }
+        }
         Ok(self.low_level.transaction(|txn| {
-            let res: rusqlite::Result<Vec<Vec<u8>>> = match (range.start_bound(), range.end_bound())
-            {
-                (Bound::Included(start), Bound::Included(end)) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key >= $1 and key <= $2 ",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], tovec)?
-                    .collect(),
-                (Bound::Included(start), Bound::Excluded(end)) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key >= $1 and key <  $2 ",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], tovec)?
-                    .collect(),
-                (Bound::Included(start), Bound::Unbounded) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key >= $1 ",
-                        self.table_name
-                    ))?
-                    .query_map(&[start], tovec)?
-                    .collect(),
-                (Bound::Excluded(start), Bound::Included(end)) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key > $1 and key <= $2",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], tovec)?
-                    .collect(),
-                (Bound::Excluded(start), Bound::Excluded(end)) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key > $1 and key < $2",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], tovec)?
-                    .collect(),
-                (Bound::Excluded(start), Bound::Unbounded) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key > $1",
-                        self.table_name
-                    ))?
-                    .query_map(&[start], tovec)?
-                    .collect(),
-                (Bound::Unbounded, Bound::Included(end)) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key <= $1",
-                        self.table_name
-                    ))?
-                    .query_map(&[end], tovec)?
-                    .collect(),
-                (Bound::Unbounded, Bound::Excluded(end)) => txn
-                    .prepare_cached(&format!(
-                        "select key from {} where key < $1",
-                        self.table_name
-                    ))?
-                    .query_map(&[end], tovec)?
-                    .collect(),
-                (Bound::Unbounded, Bound::Unbounded) => txn
-                    .prepare_cached(&format!("select key from {}", self.table_name))?
-                    .query_map([], tovec)?
-                    .collect(),
-            };
+            let statements = vec![
+                bound_to_string(range.start_bound(), "key", ">", "$1"),
+                bound_to_string(range.end_bound(), "key", "<", "$2"),
+            ];
+            let select = format!(
+                "select key from {} where {}",
+                self.table_name,
+                statements.join(" and ")
+            );
+            let mut params = Vec::new();
+
+            push_params(&mut params, range.start_bound());
+            push_params(&mut params, range.end_bound());
+
+            let res = txn
+                .prepare_cached(&select)?
+                .query_map(&params.into(), tovec)?
+                .collect();
+
             let mut toret: Vec<Bytes> = Vec::new();
             for row in res? {
                 toret.push(row.into());
