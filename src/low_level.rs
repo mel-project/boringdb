@@ -1,6 +1,6 @@
-use std::{path::PathBuf, sync::Mutex};
-
-use rusqlite::OpenFlags;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 /// Low-level, interface to the SQLite database, encapsulating pooling etc.
 pub(crate) struct LowLevel {
@@ -10,16 +10,18 @@ pub(crate) struct LowLevel {
 impl LowLevel {
     /// Opens a new LowLevel, given a path.
     pub fn open(path: impl Into<PathBuf>) -> rusqlite::Result<Self> {
-        let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_CREATE;
-        let connection = rusqlite::Connection::open_with_flags(path.into(), flags)?;
+        let flags: rusqlite::OpenFlags = rusqlite::OpenFlags::default();
+        let connection: rusqlite::Connection = rusqlite::Connection::open_with_flags(path.into(), flags)?;
         // exclusive access to the DB
-        connection.query_row("PRAGMA locking_mode = EXCLUSIVE;", [], |f| {
-            f.get::<_, String>(0)
+        connection.query_row("PRAGMA locking_mode = EXCLUSIVE;", [], |row: &rusqlite::Row| {
+            row.get::<usize, String>(0)
         })?;
         // connection.query_row("PRAGMA journal_mode = WAL;", [], |f| f.get::<_, String>(0))?;
         // connection.execute("PRAGMA synchronous = NORMAL;", [])?;
+
         // memory-mapped I/O
-        connection.query_row("PRAGMA mmap_size=1073741824;", [], |f| f.get::<_, i32>(0))?;
+        connection.query_row("PRAGMA mmap_size=1073741824;", [], |row: &rusqlite::Row| row.get::<usize, i32>(0))?;
+
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -31,8 +33,8 @@ impl LowLevel {
         action: impl FnOnce(rusqlite::Transaction) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
         let mut conn = self.connection.lock().unwrap();
-        let txn = conn.transaction()?;
-        action(txn)
+        let transaction: rusqlite::Transaction = conn.transaction()?;
+        action(transaction)
     }
 }
 
@@ -41,9 +43,10 @@ mod tests {
     use super::*;
     #[test]
     fn simple() {
-        let low_level = LowLevel::open("/tmp/lltest").unwrap();
+        let low_level = LowLevel::open("/tmp/low_level_test").expect("Could not open low_level_test.");
+
         low_level
-            .transaction(|conn| {
+            .transaction(|conn: rusqlite::Transaction| {
                 conn.execute(
                     "create table if not exists test (key blob primary key, value blob)",
                     [],

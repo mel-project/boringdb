@@ -1,6 +1,9 @@
 use crate::types::BoringResult;
-use crate::{low_level::LowLevel, Dict};
-use std::{path::PathBuf, sync::Arc};
+use crate::low_level::LowLevel;
+use crate::dict::Dict;
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A database full of maps.
 pub struct Database {

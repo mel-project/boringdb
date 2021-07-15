@@ -1,7 +1,7 @@
 [package]
 name = "boringdb"
 version = "0.4.0"
-authors = ["nullchinchilla <nullchinchilla@pm.me>"]
+authors = ["nullchinchilla <nullchinchilla@pm.me>", "Meade Kincke <meade@themelio.org>"]
 edition = "2018"
 description="Robust, reasonably high-performance key-value database built on SQLite "
 license = "ISC"
@@ -36,3 +36,7 @@ thiserror = "1.0"
 criterion = "0.3"
 easy-parallel = "3"
 env_logger = "0.8"
+
+[[example]]
+name = "write"
+path = "examples/write/src/main.rs"
