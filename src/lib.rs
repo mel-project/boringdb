@@ -24,7 +24,6 @@ mod globals;
 mod low_level;
 mod types;
 
-// pub use db::Database;
 pub use types::BoringResult;
 
 use thiserror::Error;
