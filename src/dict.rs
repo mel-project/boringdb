@@ -454,14 +454,15 @@ impl DictInner {
                 statements.join(" and ")
             );
             let mut params = Vec::new();
-
+            
             push_params(&mut params, range.start_bound());
             push_params(&mut params, range.end_bound());
 
-            let res = txn
-                .prepare_cached(&select)?
-                .query_map(&params.into(), tovec)?
-                .collect();
+            let res: rusqlite::Result<Vec<Vec<u8>>> = txn
+            .prepare_cached(&select)?
+            .query_map(params, tovec)?
+            .collect();
+    
 
             let mut toret: Vec<Bytes> = Vec::new();
             for row in res? {
