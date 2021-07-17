@@ -1,6 +1,6 @@
 [package]
 name = "boringdb"
-version = "0.4.0"
+version = "0.3.11-alpha.0"
 authors = ["nullchinchilla <nullchinchilla@pm.me>", "Meade Kincke <meade@themelio.org>"]
 edition = "2018"
 description="Robust, reasonably high-performance key-value database built on SQLite "
