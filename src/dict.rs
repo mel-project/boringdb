@@ -110,7 +110,7 @@ pub struct Transaction<'a> {
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         let _ = throttled_send(
-            &self.send_change,
+            self.send_change,
             SyncInstruction::WriteBatch(self.to_write.clone()),
         );
     }
@@ -315,7 +315,7 @@ impl DictInner {
         let mut cache = self.cache.write();
         let previous = match cache.get_mut(key) {
             None => {
-                let val = self.read_uncached(&key)?;
+                let val = self.read_uncached(key)?;
                 if let Some(val) = val.as_ref() {
                     let mut entry = CacheEntry::new(val.clone());
                     entry.deleted = true;
@@ -577,7 +577,7 @@ fn sync_to_disk(
             })
             .unwrap();
         let elapsed = tx_start_time.elapsed();
-        log::debug!(
+        eprintln!(
             "[{}] sync_to_disk finished in {:?}",
             batch_no,
             tx_start_time.elapsed()
