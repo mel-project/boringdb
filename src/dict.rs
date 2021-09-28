@@ -1,7 +1,7 @@
 #![allow(clippy::mutable_key_type)]
 use crate::globals::GLOBAL_PSEUDO_TIME;
-use crate::{low_level::LowLevel, DbError};
 use crate::types::BoringResult;
+use crate::{low_level::LowLevel, DbError};
 
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
@@ -15,11 +15,9 @@ use bytes::Bytes;
 use flume::{Receiver, Sender};
 use genawaiter::rc::Gen;
 use itertools::Itertools;
-use nanorand::Rng;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use priority_queue::PriorityQueue;
 use rusqlite::OptionalExtension;
-
 
 /// A non-cloneable on-disk mapping
 struct DictInner {
@@ -39,7 +37,8 @@ impl Drop for DictInner {
             ManuallyDrop::drop(&mut self.send_change);
         }
 
-        self.thread_handle.take()
+        self.thread_handle
+            .take()
             .expect("JoinHandle was None.")
             .join()
             .expect("Could not join on the thread.");
@@ -79,7 +78,7 @@ impl DictInner {
 
     /// Maybe garbage collect
     fn maybe_gc(&self) -> BoringResult<()> {
-        if nanorand::tls_rng().generate_range(0u32..=100000) == 0 {
+        if fastrand::usize(0..100000) == 0 {
             let cache = self.cache.upgradable_read();
             let old_len = cache.len();
             if cache.len() > self.gc_threshold {
@@ -121,7 +120,7 @@ impl DictInner {
         let mut cache = self.cache.write();
         let previous = match cache.get_mut(key) {
             None => {
-                let val = self.read_uncached(&key)?;
+                let val = self.read_uncached(key)?;
                 if let Some(val) = val.as_ref() {
                     let mut entry = CacheEntry::new(val.clone());
                     entry.deleted = true;
@@ -142,7 +141,7 @@ impl DictInner {
             &self.send_change,
             SyncInstruction::Delete(Bytes::copy_from_slice(key)),
         )
-            .map_err(|_| DbError::WriteThreadFailed)?;
+        .map_err(|_| DbError::WriteThreadFailed)?;
         drop(cache);
         Ok(previous)
     }
@@ -169,10 +168,12 @@ impl DictInner {
             &self.send_change,
             SyncInstruction::Write(key.clone(), value),
         )
-            .map_err(|_| DbError::WriteThreadFailed)?;
+        .map_err(|_| DbError::WriteThreadFailed)?;
         drop(cache);
 
-        self.cache_priorities.lock().push(key, increment_and_output_pseudotime());
+        self.cache_priorities
+            .lock()
+            .push(key, increment_and_output_pseudotime());
 
         Ok(actual_previous)
     }
@@ -187,7 +188,7 @@ impl DictInner {
                 return Ok(None);
             }
             let value = res.value.clone();
-            if nanorand::tls_rng().generate_range(0usize..=100) == 0 {
+            if fastrand::usize(0..100) == 0 {
                 self.cache_priorities
                     .lock()
                     .push(key.clone(), increment_and_output_pseudotime());
@@ -203,7 +204,9 @@ impl DictInner {
                     cache.insert(key.clone(), CacheEntry::new(value.clone()));
                 }
                 drop(cache);
-                self.cache_priorities.lock().push(key, increment_and_output_pseudotime());
+                self.cache_priorities
+                    .lock()
+                    .push(key, increment_and_output_pseudotime());
             }
 
             Ok(value)
@@ -215,7 +218,8 @@ impl DictInner {
         let read_statement = self.read_statement.clone();
 
         let result: Option<Vec<u8>> = self.low_level.transaction(move |transaction| {
-            let mut statement: rusqlite::CachedStatement = transaction.prepare_cached(&read_statement)?;
+            let mut statement: rusqlite::CachedStatement =
+                transaction.prepare_cached(&read_statement)?;
             statement.query_row(&[key], |r| r.get(0)).optional()
         })?;
 
@@ -223,86 +227,91 @@ impl DictInner {
     }
 
     /// Gets all the keys, from the disk, within a range.
-    fn range_keys_uncached<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> BoringResult<Vec<Bytes>> {
+    fn range_keys_uncached<'a>(
+        &self,
+        range: impl RangeBounds<&'a [u8]>,
+    ) -> BoringResult<Vec<Bytes>> {
         fn to_vec(row: &rusqlite::Row) -> Result<Vec<u8>, rusqlite::Error> {
             row.get::<usize, Vec<u8>>(0)
         }
-        Ok(self.low_level.transaction(|transaction: rusqlite::Transaction| {
-            let res: rusqlite::Result<Vec<Vec<u8>>> = match (range.start_bound(), range.end_bound())
-            {
-                (Bound::Included(start), Bound::Included(end)) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key >= $1 and key <= $2 ",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], to_vec)?
-                    .collect(),
-                (Bound::Included(start), Bound::Excluded(end)) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key >= $1 and key <  $2 ",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], to_vec)?
-                    .collect(),
-                (Bound::Included(start), Bound::Unbounded) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key >= $1 ",
-                        self.table_name
-                    ))?
-                    .query_map(&[start], to_vec)?
-                    .collect(),
-                (Bound::Excluded(start), Bound::Included(end)) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key > $1 and key <= $2",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], to_vec)?
-                    .collect(),
-                (Bound::Excluded(start), Bound::Excluded(end)) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key > $1 and key < $2",
-                        self.table_name
-                    ))?
-                    .query_map(&[start, end], to_vec)?
-                    .collect(),
-                (Bound::Excluded(start), Bound::Unbounded) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key > $1",
-                        self.table_name
-                    ))?
-                    .query_map(&[start], to_vec)?
-                    .collect(),
-                (Bound::Unbounded, Bound::Included(end)) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key <= $1",
-                        self.table_name
-                    ))?
-                    .query_map(&[end], to_vec)?
-                    .collect(),
-                (Bound::Unbounded, Bound::Excluded(end)) => transaction
-                    .prepare_cached(&format!(
-                        "select key from {} where key < $1",
-                        self.table_name
-                    ))?
-                    .query_map(&[end], to_vec)?
-                    .collect(),
-                (Bound::Unbounded, Bound::Unbounded) => transaction
-                    .prepare_cached(&format!("select key from {}", self.table_name))?
-                    .query_map([], to_vec)?
-                    .collect(),
-            };
-            let mut toret: Vec<Bytes> = Vec::new();
+        Ok(self
+            .low_level
+            .transaction(|transaction: rusqlite::Transaction| {
+                let res: rusqlite::Result<Vec<Vec<u8>>> =
+                    match (range.start_bound(), range.end_bound()) {
+                        (Bound::Included(start), Bound::Included(end)) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key >= $1 and key <= $2 ",
+                                self.table_name
+                            ))?
+                            .query_map(&[start, end], to_vec)?
+                            .collect(),
+                        (Bound::Included(start), Bound::Excluded(end)) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key >= $1 and key <  $2 ",
+                                self.table_name
+                            ))?
+                            .query_map(&[start, end], to_vec)?
+                            .collect(),
+                        (Bound::Included(start), Bound::Unbounded) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key >= $1 ",
+                                self.table_name
+                            ))?
+                            .query_map(&[start], to_vec)?
+                            .collect(),
+                        (Bound::Excluded(start), Bound::Included(end)) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key > $1 and key <= $2",
+                                self.table_name
+                            ))?
+                            .query_map(&[start, end], to_vec)?
+                            .collect(),
+                        (Bound::Excluded(start), Bound::Excluded(end)) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key > $1 and key < $2",
+                                self.table_name
+                            ))?
+                            .query_map(&[start, end], to_vec)?
+                            .collect(),
+                        (Bound::Excluded(start), Bound::Unbounded) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key > $1",
+                                self.table_name
+                            ))?
+                            .query_map(&[start], to_vec)?
+                            .collect(),
+                        (Bound::Unbounded, Bound::Included(end)) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key <= $1",
+                                self.table_name
+                            ))?
+                            .query_map(&[end], to_vec)?
+                            .collect(),
+                        (Bound::Unbounded, Bound::Excluded(end)) => transaction
+                            .prepare_cached(&format!(
+                                "select key from {} where key < $1",
+                                self.table_name
+                            ))?
+                            .query_map(&[end], to_vec)?
+                            .collect(),
+                        (Bound::Unbounded, Bound::Unbounded) => transaction
+                            .prepare_cached(&format!("select key from {}", self.table_name))?
+                            .query_map([], to_vec)?
+                            .collect(),
+                    };
+                let mut toret: Vec<Bytes> = Vec::new();
 
-            for row in res? {
-                toret.push(row.into());
-            }
+                for row in res? {
+                    toret.push(row.into());
+                }
 
-            for pair in toret.windows(2) {
-                assert!(pair[0] < pair[1]);
-            }
+                for pair in toret.windows(2) {
+                    assert!(pair[0] < pair[1]);
+                }
 
-            Ok(toret)
-        })?)
+                Ok(toret)
+            })?)
     }
 }
 
@@ -319,7 +328,11 @@ impl Dict {
     }
 
     /// Inserts a key/value pair.
-    pub fn insert(&self, key: impl Into<Bytes>, val: impl Into<Bytes>) -> BoringResult<Option<Bytes>> {
+    pub fn insert(
+        &self,
+        key: impl Into<Bytes>,
+        val: impl Into<Bytes>,
+    ) -> BoringResult<Option<Bytes>> {
         self.inner.write(key.into(), val.into())
     }
 

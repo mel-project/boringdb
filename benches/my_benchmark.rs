@@ -2,7 +2,6 @@ use std::ops::Deref;
 
 use boringdb::{Database, Dict};
 use criterion::{criterion_group, criterion_main, Criterion};
-use nanorand::RNG;
 use once_cell::sync::Lazy;
 
 static TEST_DB: Lazy<Dict> = Lazy::new(|| {
@@ -31,10 +30,7 @@ impl TestDb for Dict {
 
 fn small_key_write(b: &mut criterion::Bencher, db: &impl TestDb) {
     b.iter(move || {
-        let key = format!(
-            "hello world {}",
-            nanorand::tls_rng().generate_range(0, u64::MAX)
-        );
+        let key = format!("hello world {}", fastrand::u64(0..=u64::MAX));
         db.insert_pair(key.as_bytes(), b"oh no".as_ref());
         // log::info!("inserted {}", i);
         // log::info!("got {:?}", dict.get(key.as_bytes()).unwrap().unwrap());
@@ -44,10 +40,7 @@ fn small_key_write(b: &mut criterion::Bencher, db: &impl TestDb) {
 
 fn small_key_write_sled(b: &mut criterion::Bencher) {
     b.iter(move || {
-        let key = format!(
-            "hello world {}",
-            nanorand::tls_rng().generate_range(0, u64::MAX)
-        );
+        let key = format!("hello world {}", fastrand::u64(0..=u64::MAX));
         TEST_SLED_DB
             .insert(key.as_bytes().to_vec(), b"oh no".as_ref())
             .unwrap();

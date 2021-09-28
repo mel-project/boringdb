@@ -17,12 +17,13 @@
 //! ## Examples
 //! Examples can be found in the [examples directory](https://github.com/themeliolabs/boringdb/tree/master/examples)
 
-
-pub mod dict;
-pub mod db;
+mod db;
+mod dict;
 mod globals;
 mod low_level;
 mod types;
+pub use db::*;
+pub use dict::*;
 
 pub use types::BoringResult;
 
@@ -49,12 +50,10 @@ mod tests {
     use easy_parallel::Parallel;
     use env_logger::Env;
     use log::{debug, SetLoggerError};
-    use nanorand::Rng;
-
-
     fn init_logs() {
-        let initialise_logs: Result<(), SetLoggerError> = env_logger::Builder::from_env(Env::default().default_filter_or("boringdb=debug"))
-            .try_init();
+        let initialise_logs: Result<(), SetLoggerError> =
+            env_logger::Builder::from_env(Env::default().default_filter_or("boringdb=debug"))
+                .try_init();
 
         match initialise_logs {
             Ok(_) => debug!("Logging initialised successfully."),
@@ -67,28 +66,29 @@ mod tests {
 
         const UNHAPPY_STRING_BYTES: &[u8; 5] = b"oh no";
 
-        let database: Database = Database::open("/tmp/labooyah.db").expect(" Could not open test database.");
-        let dict: Dict = database.open_dict("labooyah").expect("Could not open dictionary.");
+        let database: Database =
+            Database::open("/tmp/labooyah.db").expect(" Could not open test database.");
+        let dict: Dict = database
+            .open_dict("labooyah")
+            .expect("Could not open dictionary.");
 
         let range: Range<i32> = 0..1000;
 
         range.into_iter().for_each(|_index| {
-            let key: String = format!(
-                "hello world {}",
-                nanorand::tls_rng().generate_range(0..=u64::MAX)
-            );
+            let key: String = format!("hello world {}", fastrand::u64(0..=u64::MAX));
 
             dict.insert(key.as_bytes().to_vec(), UNHAPPY_STRING_BYTES.as_ref())
                 .expect("Could not insert into dictionary.");
             // log::info!("inserted {}", i);
             // log::info!("got {:?}", dict.get(key.as_bytes()).unwrap().unwrap());
 
-
-            let output_bytes: Bytes = dict.get(key.as_bytes()).expect("BoringResult was None.").expect("Bytes was None");
+            let output_bytes: Bytes = dict
+                .get(key.as_bytes())
+                .expect("BoringResult was None.")
+                .expect("Bytes was None");
 
             assert_eq!(output_bytes.as_ref(), UNHAPPY_STRING_BYTES);
         });
-
     }
     #[test]
     fn transactional_increment() {
@@ -100,8 +100,11 @@ mod tests {
         const COUNTER_BYTES: &[u8; 7] = b"counter";
 
         {
-            let database: Database = Database::open("/tmp/transactions.db").expect(" Could not open test database.");
-            let dict: Dict = database.open_dict("labooyah").expect("Could not open dictionary.");
+            let database: Database =
+                Database::open("/tmp/transactions.db").expect(" Could not open test database.");
+            let dict: Dict = database
+                .open_dict("labooyah")
+                .expect("Could not open dictionary.");
             dict.insert(b"counter".to_vec(), 0u64.to_be_bytes().to_vec())
                 .expect("Could not insert into dictionary.");
 
@@ -112,14 +115,16 @@ mod tests {
                     for _ in 0..INCREMENTS {
                         let mut transaction: Transaction = dict.transaction().unwrap();
                         let counter = u64::from_be_bytes(
-                            transaction.get(COUNTER_BYTES)
+                            transaction
+                                .get(COUNTER_BYTES)
                                 .unwrap()
                                 .unwrap()
                                 .as_ref()
                                 .try_into()
                                 .unwrap(),
                         );
-                        transaction.insert(COUNTER_BYTES.to_vec(), (counter + 1).to_be_bytes().to_vec())
+                        transaction
+                            .insert(COUNTER_BYTES.to_vec(), (counter + 1).to_be_bytes().to_vec())
                             .unwrap();
                     }
                 });
