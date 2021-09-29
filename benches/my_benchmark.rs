@@ -38,21 +38,6 @@ fn small_key_write(b: &mut criterion::Bencher, db: &impl TestDb) {
     });
 }
 
-fn small_key_write_sled(b: &mut criterion::Bencher) {
-    b.iter(move || {
-        let key = format!("hello world {}", fastrand::u64(0..=u64::MAX));
-        TEST_SLED_DB
-            .insert(key.as_bytes().to_vec(), b"oh no".as_ref())
-            .unwrap();
-        // log::info!("inserted {}", i);
-        // log::info!("got {:?}", dict.get(key.as_bytes()).unwrap().unwrap());
-        assert_eq!(
-            TEST_SLED_DB.get(key.as_bytes()).unwrap().unwrap().as_ref(),
-            b"oh no"
-        );
-    });
-}
-
 fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("small_key_write", |b| small_key_write(b, TEST_DB.deref()));
     c.bench_function("small_key_write_sled", |b| {

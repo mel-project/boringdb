@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::{Arc, RwLock};
+
 
 /// Low-level, interface to the SQLite database, encapsulating pooling etc.
 pub(crate) struct LowLevel {

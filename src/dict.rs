@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use dashmap::{mapref::entry::Entry, DashMap};
 use flume::{Receiver, Sender};
 use genawaiter::rc::Gen;
 use itertools::Itertools;
@@ -24,6 +25,7 @@ struct DictInner {
     cache: RwLock<BTreeMap<Bytes, CacheEntry>>,
     cache_priorities: Mutex<PriorityQueue<Bytes, u64>>,
     send_change: ManuallyDrop<Sender<SyncInstruction>>,
+    dirty_set: Arc<DashMap<Bytes, usize>>,
     thread_handle: Option<JoinHandle<Option<()>>>,
     low_level: Arc<LowLevel>,
     gc_threshold: usize,
@@ -49,16 +51,24 @@ impl DictInner {
     /// Create a new map inner.
     fn new(low_level: Arc<LowLevel>, table_name: &str) -> Self {
         let (send_change, recv_change) = flume::bounded(20000);
+        let dirty_set = Arc::new(DashMap::new());
         let thread_handle = {
             let table_name = table_name.to_string();
             let write_statement = format!("insert into {}(key, value) values ($1, $2) on conflict(key) do update set value = excluded.value", table_name);
             let delete_statement = format!("delete from {} where key = $1", table_name);
             let low_level = low_level.clone();
+            let dirty_set = dirty_set.clone();
             Some(
                 std::thread::Builder::new()
                     .name(format!("boringdb-{}", table_name))
                     .spawn(move || {
-                        sync_to_disk(recv_change, low_level, write_statement, delete_statement)
+                        sync_to_disk(
+                            recv_change,
+                            low_level,
+                            write_statement,
+                            delete_statement,
+                            dirty_set,
+                        )
                     })
                     .expect("Could not join on the thread."),
             )
@@ -69,6 +79,7 @@ impl DictInner {
             cache_priorities: Default::default(),
             send_change: ManuallyDrop::new(send_change),
             thread_handle,
+            dirty_set,
             low_level,
             read_statement: format!("select value from {} where key = $1", table_name),
             gc_threshold: 100000,
@@ -83,19 +94,20 @@ impl DictInner {
             let old_len = cache.len();
             if cache.len() > self.gc_threshold {
                 if let Ok(mut cache) = RwLockUpgradableReadGuard::try_upgrade(cache) {
-                    // we flush everything
-                    self.flush()?;
                     assert_eq!(0, self.send_change.len());
                     if let Some(mut priorities) = self.cache_priorities.try_lock() {
                         log::warn!("garbage collect started! {} priorities", priorities.len());
                         while let Some((k, _)) = priorities.pop() {
-                            cache.remove(&k);
+                            if !self.dirty_set.contains_key(&k) {
+                                cache.remove(&k);
+                            }
                             if cache.len() < self.gc_threshold / 2 {
                                 break;
                             }
                         }
                         if cache.len() > self.gc_threshold / 2 {
                             log::warn!("** LRU failed to get the cache size under control? Killing everything just because**");
+                            self.flush()?;
                             cache.clear();
                         }
                         log::warn!("GC complete: {} => {}", old_len, cache.len());
@@ -109,7 +121,7 @@ impl DictInner {
 
     /// Flushes to disk
     fn flush(&self) -> BoringResult<()> {
-        let (sender, receiver) = flume::bounded(0);
+        let (sender, receiver) = flume::bounded(1);
         throttled_send(&self.send_change, SyncInstruction::Flush(sender))
             .map_err(|_| DbError::WriteThreadFailed)?;
         receiver.recv().map_err(|_| DbError::WriteThreadFailed)
@@ -136,12 +148,11 @@ impl DictInner {
                 Some(val.value.clone())
             }
         };
+        let key = Bytes::copy_from_slice(key);
+        *self.dirty_set.entry(key.clone()).or_default() += 1;
         // we now signal the background thread
-        throttled_send(
-            &self.send_change,
-            SyncInstruction::Delete(Bytes::copy_from_slice(key)),
-        )
-        .map_err(|_| DbError::WriteThreadFailed)?;
+        throttled_send(&self.send_change, SyncInstruction::Delete(key))
+            .map_err(|_| DbError::WriteThreadFailed)?;
         drop(cache);
         Ok(previous)
     }
@@ -164,6 +175,7 @@ impl DictInner {
             Some(val) => Some(val),
         };
 
+        *self.dirty_set.entry(key.clone()).or_default() += 1;
         throttled_send(
             &self.send_change,
             SyncInstruction::Write(key.clone(), value),
@@ -378,6 +390,7 @@ impl Dict {
         let transaction = Transaction {
             send_change: &self.inner.send_change,
             cache,
+            dirty_set: self.inner.dirty_set.clone(),
             read_uncached: Box::new(move |val| self.inner.read_uncached(val)),
             cache_priorities: &self.inner.cache_priorities,
             dinner: &self.inner,
@@ -399,6 +412,7 @@ pub struct Transaction<'a> {
     send_change: &'a Sender<SyncInstruction>,
     cache: RwLockWriteGuard<'a, BTreeMap<Bytes, CacheEntry>>,
     cache_priorities: &'a Mutex<PriorityQueue<Bytes, u64>>,
+    dirty_set: Arc<DashMap<Bytes, usize>>,
     to_write: Vec<(Bytes, Option<Bytes>)>,
     dinner: &'a DictInner,
     read_uncached: Box<dyn Fn(&[u8]) -> BoringResult<Option<Bytes>> + 'a>,
@@ -407,7 +421,7 @@ pub struct Transaction<'a> {
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         let _ = throttled_send(
-            &self.send_change,
+            self.send_change,
             SyncInstruction::WriteBatch(self.to_write.clone()),
         );
     }
@@ -419,6 +433,7 @@ impl<'a> Transaction<'a> {
         let key: Bytes = key.into();
         let val: Bytes = val.into();
         self.cache.insert(key.clone(), CacheEntry::new(val.clone()));
+        *self.dirty_set.entry(key.clone()).or_default() += 1;
         self.cache_priorities
             .lock()
             .push(key.clone(), increment_and_output_pseudotime());
@@ -431,8 +446,9 @@ impl<'a> Transaction<'a> {
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> BoringResult<()> {
         if let Some(entry) = self.cache.get_mut(key.as_ref()) {
             entry.deleted = true;
-            self.to_write
-                .push((Bytes::copy_from_slice(key.as_ref()), None));
+            let key = Bytes::copy_from_slice(key.as_ref());
+            self.to_write.push((key.clone(), None));
+            *self.dirty_set.entry(key).or_default() += 1;
         }
 
         Ok(())
@@ -532,6 +548,7 @@ fn sync_to_disk(
     low_level: Arc<LowLevel>,
     write_statement: String,
     delete_statement: String,
+    dirty_set: Arc<DashMap<Bytes, usize>>,
 ) -> Option<()> {
     // To prevent excessively bursty backpressure, we limit the amount of time spent within a transaction.
     // This is done through a TCP-like AIMD approach where we adjust the maximum batch size.
@@ -571,13 +588,24 @@ fn sync_to_disk(
 
         // Writes
         let mut writes: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
-
+        let dedirty = |key| match dirty_set.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let ctr = entry.get_mut();
+                *ctr -= 1;
+                if *ctr == 0 {
+                    entry.remove();
+                }
+            }
+            _ => panic!("oh no"),
+        };
         for instruction in instructions.drain(..) {
             match instruction {
                 SyncInstruction::Write(key, value) => {
+                    dedirty(key.clone());
                     writes.insert(key, Some(value));
                 }
                 SyncInstruction::Delete(key) => {
+                    dedirty(key.clone());
                     // if writes.remove(&key).is_none() {
                     writes.insert(key, None);
                     // }
@@ -585,6 +613,7 @@ fn sync_to_disk(
                 SyncInstruction::Flush(flush) => flush_buff.push(flush),
                 SyncInstruction::WriteBatch(kvv) => {
                     for (key, value) in kvv {
+                        dedirty(key.clone());
                         writes.insert(key, value);
                     }
                 }
