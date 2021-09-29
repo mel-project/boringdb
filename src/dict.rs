@@ -552,7 +552,7 @@ fn sync_to_disk(
 ) -> Option<()> {
     // To prevent excessively bursty backpressure, we limit the amount of time spent within a transaction.
     // This is done through a TCP-like AIMD approach where we adjust the maximum batch size.
-    const MAX_TX_TIME: Duration = Duration::from_millis(200);
+    const MAX_TX_TIME: Duration = Duration::from_millis(500);
     let mut max_batch_size: usize = 100;
 
     log::debug!("sync_to_disk started");
@@ -561,7 +561,7 @@ fn sync_to_disk(
     for batch_no in 0u64.. {
         instructions.push(recv_change.recv().ok()?);
 
-        let deadline: Instant = Instant::now() + Duration::from_millis(50);
+        let deadline: Instant = Instant::now() + Duration::from_millis(250);
 
         while let Ok(instr) = recv_change.recv_deadline(deadline) {
             instructions.push(instr);
