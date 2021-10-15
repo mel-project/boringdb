@@ -94,7 +94,6 @@ impl DictInner {
             let old_len = cache.len();
             if cache.len() > self.gc_threshold {
                 if let Ok(mut cache) = RwLockUpgradableReadGuard::try_upgrade(cache) {
-                    assert_eq!(0, self.send_change.len());
                     if let Some(mut priorities) = self.cache_priorities.try_lock() {
                         log::warn!("garbage collect started! {} priorities", priorities.len());
                         while let Some((k, _)) = priorities.pop() {
