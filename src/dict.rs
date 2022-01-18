@@ -44,6 +44,7 @@ impl Drop for DictInner {
             .expect("JoinHandle was None.")
             .join()
             .expect("Could not join on the thread.");
+        eprintln!("background thread is kill");
     }
 }
 
