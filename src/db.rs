@@ -1,6 +1,6 @@
-use crate::types::BoringResult;
-use crate::low_level::LowLevel;
 use crate::dict::Dict;
+use crate::low_level::LowLevel;
+use crate::types::BoringResult;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ impl Database {
         self.low_level.transaction(|transaction| {
             transaction.execute(
                 &format!(
-                    "create table if not exists {} (key BLOB PRIMARY KEY, value BLOB NOT NULL) without rowid",
+                    "create table if not exists {} (key BLOB PRIMARY KEY, value BLOB NOT NULL)",
                     name
                 ),
                 [],
