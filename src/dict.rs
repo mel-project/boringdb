@@ -83,7 +83,7 @@ impl DictInner {
             dirty_set,
             low_level,
             read_statement: format!("select value from {} where key = $1", table_name),
-            gc_threshold: 100000,
+            gc_threshold: 1000,
             table_name: table_name.to_string(),
         }
     }

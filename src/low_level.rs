@@ -24,10 +24,8 @@ impl LowLevel {
             [],
             |row: &rusqlite::Row| row.get::<usize, String>(0),
         )?;
-        connection.query_row("PRAGMA journal_mode = DELETE;", [], |f| {
-            f.get::<_, String>(0)
-        })?;
-        // connection.execute("PRAGMA synchronous = NORMAL;", [])?;
+        connection.query_row("PRAGMA journal_mode = WAL;", [], |f| f.get::<_, String>(0))?;
+        connection.execute("PRAGMA synchronous = NORMAL;", [])?;
 
         Ok(Self {
             connection: Mutex::new(connection),
