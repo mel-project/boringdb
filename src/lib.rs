@@ -41,13 +41,11 @@ pub enum DbError {
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
-    use crate::dict::{Dict, Transaction};
+    use crate::dict::Dict;
 
-    use std::convert::TryInto;
     use std::ops::Range;
 
     use bytes::Bytes;
-    use easy_parallel::Parallel;
     use env_logger::Env;
     use log::{debug, SetLoggerError};
     fn init_logs() {
@@ -74,7 +72,7 @@ mod tests {
 
         let range: Range<i32> = 0..1000;
 
-        range.into_iter().for_each(|_index| {
+        range.into_iter().for_each(|index| {
             let key: String = format!("hello world {}", fastrand::u64(0..=u64::MAX));
 
             dict.insert(key.as_bytes().to_vec(), UNHAPPY_STRING_BYTES.as_ref())
@@ -89,60 +87,5 @@ mod tests {
 
             assert_eq!(output_bytes.as_ref(), UNHAPPY_STRING_BYTES);
         });
-    }
-    #[test]
-    fn transactional_increment() {
-        init_logs();
-
-        const THREADS: u64 = 100;
-        const INCREMENTS: u64 = 100;
-
-        const COUNTER_BYTES: &[u8; 7] = b"counter";
-
-        {
-            let database: Database =
-                Database::open("/tmp/transactions.db").expect(" Could not open test database.");
-            let dict: Dict = database
-                .open_dict("labooyah")
-                .expect("Could not open dictionary.");
-            dict.insert(b"counter".to_vec(), 0u64.to_be_bytes().to_vec())
-                .expect("Could not insert into dictionary.");
-
-            let mut parallel: Parallel<()> = Parallel::new();
-
-            for _ in 0..THREADS {
-                parallel = parallel.add(|| {
-                    for _ in 0..INCREMENTS {
-                        let mut transaction: Transaction = dict.transaction().unwrap();
-                        let counter = u64::from_be_bytes(
-                            transaction
-                                .get(COUNTER_BYTES)
-                                .unwrap()
-                                .unwrap()
-                                .as_ref()
-                                .try_into()
-                                .unwrap(),
-                        );
-                        transaction
-                            .insert(COUNTER_BYTES.to_vec(), (counter + 1).to_be_bytes().to_vec())
-                            .unwrap();
-                    }
-                });
-            }
-            parallel.run();
-        }
-
-        let database: Database = Database::open("/tmp/transactions.db").unwrap();
-        let dict: Dict = database.open_dict("labooyah").unwrap();
-        let final_count: u64 = u64::from_be_bytes(
-            dict.get(b"counter")
-                .unwrap()
-                .unwrap()
-                .as_ref()
-                .try_into()
-                .unwrap(),
-        );
-
-        assert_eq!(final_count, THREADS * INCREMENTS);
     }
 }

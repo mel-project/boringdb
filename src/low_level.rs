@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use rusqlite::Connection;
+
 /// Low-level, interface to the SQLite database, encapsulating pooling etc.
 pub(crate) struct LowLevel {
-    connection: Mutex<rusqlite::Connection>,
+    conn_send: flume::Sender<Connection>,
+    conn_recv: flume::Receiver<Connection>,
 }
 
 impl Drop for LowLevel {
@@ -16,30 +19,53 @@ impl LowLevel {
     /// Opens a new LowLevel, given a path.
     pub fn open(path: impl Into<PathBuf>) -> rusqlite::Result<Self> {
         let flags: rusqlite::OpenFlags = rusqlite::OpenFlags::default();
-        let connection: rusqlite::Connection =
-            rusqlite::Connection::open_with_flags(path.into(), flags)?;
-        // exclusive access to the DB
-        connection.query_row(
-            "PRAGMA locking_mode = EXCLUSIVE;",
-            [],
-            |row: &rusqlite::Row| row.get::<usize, String>(0),
-        )?;
-        connection.query_row("PRAGMA journal_mode = WAL;", [], |f| f.get::<_, String>(0))?;
-        connection.execute("PRAGMA synchronous = NORMAL;", [])?;
-
+        let (conn_send, conn_recv) = flume::bounded(16);
+        let path: PathBuf = path.into();
+        for _ in 0..16 {
+            let connection: rusqlite::Connection =
+                rusqlite::Connection::open_with_flags(path.clone(), flags)?;
+            connection.query_row("PRAGMA journal_mode = WAL;", [], |f| f.get::<_, String>(0))?;
+            connection.execute("PRAGMA synchronous = NORMAL;", [])?;
+            conn_send.send(connection).unwrap();
+        }
         Ok(Self {
-            connection: Mutex::new(connection),
+            conn_send,
+            conn_recv,
         })
     }
 
     /// Runs a transaction in a closure.
     pub fn transaction<T>(
         &self,
-        action: impl FnOnce(rusqlite::Transaction) -> rusqlite::Result<T>,
+        mut action: impl FnMut(rusqlite::Transaction) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
-        let mut conn = self.connection.lock().unwrap();
-        let transaction: rusqlite::Transaction = conn.transaction()?;
-        action(transaction)
+        let mut conn = self.conn_recv.recv().unwrap();
+        let ee;
+        loop {
+            let transaction = conn.transaction();
+            match transaction {
+                Ok(transaction) => match action(transaction) {
+                    Ok(t) => {
+                        ee = Ok(t);
+                        break;
+                    }
+                    Err(err) => {
+                        if err.to_string().contains("busy") {
+                            continue;
+                        } else {
+                            ee = Err(err);
+                            break;
+                        }
+                    }
+                },
+                Err(err) => {
+                    ee = Err(err);
+                    break;
+                }
+            }
+        }
+        self.conn_send.send(conn).unwrap();
+        ee
     }
 }
 
