@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use std::sync::Mutex;
+use std::{path::PathBuf, time::Duration};
 
 use rusqlite::Connection;
 
@@ -50,7 +50,8 @@ impl LowLevel {
                         break;
                     }
                     Err(err) => {
-                        if err.to_string().contains("busy") {
+                        if err.to_string().contains("locked") {
+                            std::thread::sleep(Duration::from_secs_f64(fastrand::f64() / 50.0));
                             continue;
                         } else {
                             ee = Err(err);
